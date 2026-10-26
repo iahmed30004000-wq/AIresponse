@@ -312,7 +312,7 @@ export default function CampaignsPage() {
                 إلغاء
               </Button>
             )}
-            <Button size="sm" variant="ghost" disabled={busy !== null} loading={busy === `dry:${c.id}`} onClick={() => dryRunNow(c.id)}>معاينة (Dry-Run)</Button>
+            <Button size="sm" variant="ghost" disabled={busy !== null} loading={busy === `dry:${c.id}`} onClick={() => dryRunNow(c.id)}>معاينة بلا إرسال</Button>
           </div>
 
           {selected === c.id && dryRunForId === c.id && dryRun && (

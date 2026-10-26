@@ -296,7 +296,7 @@ export default function KnowledgePage() {
           <Select value={category} onChange={(e) => setCategory(e.target.value)} aria-label="التصنيف" className="w-40">
             <option value="">كل التصنيفات</option>
             {CATEGORIES.map((c) => (
-              <option key={c} value={c}>{c}</option>
+              <option key={c} value={c}>{label(c)}</option>
             ))}
           </Select>
         </div>
@@ -435,7 +435,7 @@ export default function KnowledgePage() {
           <Field label="التصنيف">
             <Select value={editForm.category} onChange={(e) => setEditForm((s) => ({ ...s, category: e.target.value }))}>
               {CATEGORIES.map((c) => (
-                <option key={c} value={c}>{c}</option>
+                <option key={c} value={c}>{label(c)}</option>
               ))}
             </Select>
           </Field>

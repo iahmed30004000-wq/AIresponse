@@ -10,6 +10,7 @@ import { Skeleton } from "@/components/ui/skeleton";
 import { EmptyNext, EmptyState } from "@/components/ui/empty-state";
 import { useToast } from "@/components/ui/toast";
 import { formatNumber } from "@/lib/i18n";
+import { TIMEZONE_OPTIONS } from "@/lib/timezones";
 
 /**
  * P10 — مركز التحليلات الموحد: تبويبات فوق طبقة API القائمة (نفس الخادم،
@@ -303,7 +304,7 @@ export default function AnalyticsPage() {
           {RANGES.map(([v, l]) => <option key={v} value={v}>{l}</option>)}
         </Select>
         <Select value={timezone} onChange={(e) => setTimezone(e.target.value)} aria-label="المنطقة الزمنية" className="w-auto">
-          {["UTC", "Asia/Damascus", "Asia/Riyadh", "Asia/Dubai", "Africa/Cairo"].map((tz) => <option key={tz} value={tz}>{tz}</option>)}
+          {TIMEZONE_OPTIONS.map(([v, l]) => <option key={v} value={v}>{l}</option>)}
         </Select>
         {tab === "exec" && (
           <label className="flex items-center gap-1.5 text-xs text-ink-muted">
