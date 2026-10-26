@@ -3,12 +3,14 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import Link from "next/link";
 import { usePathname, useRouter } from "next/navigation";
-import { Bell, ChevronDown, ChevronLeft, CircleHelp, LogOut, Menu, Search, UserRound, Users } from "lucide-react";
+import { Bell, ChevronDown, ChevronLeft, CircleHelp, Compass, LogOut, Menu, Search, UserRound, Users } from "lucide-react";
 import { cn } from "@/lib/cn";
 import { t } from "@/lib/i18n";
 import { groupLanding, pageForPath, type NavGroupView } from "@/lib/nav-model";
 import { searchPages } from "@/lib/nav-search";
 import { guideForPath, visitGuide } from "@/lib/page-guides";
+import { TOUR_SEEN_KEY, shouldAutoStartTour } from "@/lib/guided-tour";
+import { startGuidedTour } from "./guided-tour";
 import { PageGuidePanel } from "./page-guide";
 import { Sidebar } from "./app-sidebar";
 import { GroupTabs, TABS_HEIGHT } from "./group-tabs";
@@ -92,6 +94,27 @@ export function AppShell({
       setGuideOpen(false); // تخزين محجوب (وضع خاص) — الشرح بيبقى بزر «؟»
     }
   }, [guideHref, fullBleed]);
+  // الجولة السريعة: مرة وحدة أول دخول للرئيسية (بعدها من زر «جولة»). بتسكّر
+  // شرح الصفحة قبل ما تبلّش حتى ما يتراكبوا.
+  const runTour = () => {
+    setGuideOpen(false);
+    startGuidedTour(() => {
+      try {
+        localStorage.setItem(TOUR_SEEN_KEY, "1");
+      } catch { /* ignore */ }
+    });
+  };
+  useEffect(() => {
+    let seen: string | null = "1";
+    try {
+      seen = localStorage.getItem(TOUR_SEEN_KEY);
+    } catch { /* تخزين محجوب: ما منشغّلها لحالها */ }
+    if (!shouldAutoStartTour(pathname, seen)) return;
+    const timer = setTimeout(runTour, 700); // بعد ما ترسم القائمة
+    return () => clearTimeout(timer);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [pathname]);
+
   useEffect(() => {
     if (!guideOpen) return;
     const onKey = (e: KeyboardEvent) => {
@@ -220,6 +243,7 @@ export function AppShell({
                 <form
                   onSubmit={onSearch}
                   role="search"
+                  data-tour="search"
                   className="relative hidden md:block"
                   onBlur={(e) => {
                     if (!e.currentTarget.contains(e.relatedTarget as Node | null)) closeJump();
@@ -281,6 +305,7 @@ export function AppShell({
                   <button
                     type="button"
                     onClick={() => setGuideOpen((o) => !o)}
+                    data-tour="help"
                     aria-label="شرح هذه الصفحة"
                     title="شرح هذه الصفحة"
                     aria-expanded={guideOpen}
@@ -293,6 +318,16 @@ export function AppShell({
                     <CircleHelp size={19} strokeWidth={1.75} />
                   </button>
                 )}
+                <button
+                  type="button"
+                  onClick={runTour}
+                  data-tour="tour"
+                  aria-label="جولة سريعة بالموقع"
+                  title="جولة سريعة بالموقع"
+                  className="rounded-lg p-2 text-ink-muted transition-colors hover:bg-surface-hover hover:text-ink"
+                >
+                  <Compass size={19} strokeWidth={1.75} />
+                </button>
                 <Link
                   href="/handoffs"
                   aria-label={t.nav.handoffs}
