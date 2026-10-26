@@ -45,7 +45,7 @@ describe("الحالات الفاضية الفعلية بتدلّ على الخ�
     ["src/app/(dashboard)/feedback/page.tsx", 'title="لا توجد آراء"'],
     ["src/app/(dashboard)/settings/team/team-view.tsx", 'title="لا أعضاء"'],
     ["src/app/(dashboard)/intelligence/page.tsx", 'title="لا محادثات بعد"'],
-    ["src/app/(dashboard)/analytics/products/page.tsx", 'title="لا توجد بيانات"'],
+    ["src/app/(dashboard)/analytics/page.tsx", 'title="لا بيانات منتجات بهالفترة"'],
     ["src/app/(dashboard)/orders/page.tsx", "title={t.orders.emptyTitle}"],
   ];
 
