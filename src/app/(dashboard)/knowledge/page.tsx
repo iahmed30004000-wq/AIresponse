@@ -416,7 +416,7 @@ export default function KnowledgePage() {
               <div className="min-w-0">
                 <p className="text-sm font-bold text-ink">{f.question}</p>
                 <p className="mt-0.5 text-xs leading-relaxed text-ink-muted">{f.answer}</p>
-                {f.category && <Badge className="mt-1.5">{f.category}</Badge>}
+                {f.category && <Badge className="mt-1.5">{label(f.category)}</Badge>}
               </div>
               <button onClick={() => toggleFaq(f)} className={`shrink-0 rounded-full px-2.5 py-0.5 text-[11px] font-bold ring-1 ring-inset transition ${f.isActive ? "bg-emerald-500/10 text-emerald-700 ring-emerald-500/25 dark:text-emerald-300" : "bg-slate-500/10 text-slate-500 ring-slate-500/20"}`}>
                 {f.isActive ? "نشط" : "معطل"}
