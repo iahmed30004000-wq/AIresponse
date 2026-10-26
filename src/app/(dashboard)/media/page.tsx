@@ -449,7 +449,12 @@ export default function MediaPage() {
 
       {!loading && items.length === 0 && !error && (
         <GlassCard>
-          <EmptyState illustration="/brand/empty-media.webp" title={t.media.emptyTitle} description={t.media.emptyDesc} />
+          <EmptyState
+            illustration="/brand/empty-media.webp"
+            title={t.media.emptyTitle}
+            description={t.media.emptyDesc}
+            action={<Button size="sm" onClick={() => fileRef.current?.click()}>رفع صور منتجاتك</Button>}
+          />
         </GlassCard>
       )}
 

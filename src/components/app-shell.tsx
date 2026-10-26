@@ -101,6 +101,8 @@ export function AppShell({
     return () => document.removeEventListener("keydown", onKey);
   }, [guideOpen]);
   // «الخطوة الجاية» بتظهر بس إذا العضو بيقدر يفتح هديك الصفحة.
+  // «الفريق» بقائمة الحساب بس لمين بيقدر يفتحها (وإلا ٤٠٣).
+  const canTeam = groups.some((g) => g.pages.some((p) => p.href === "/settings/team"));
   const nextAllowed = guideHit
     ? groups.some((g) => g.pages.some((p) => p.href === guideHit.guide.next.href))
     : false;
@@ -327,15 +329,17 @@ export function AppShell({
                         <UserRound size={15} className="text-ink-subtle" />
                         حسابي
                       </Link>
-                      <Link
-                        href="/settings/team"
-                        role="menuitem"
-                        onClick={() => setAccountOpen(false)}
-                        className="flex items-center gap-2 rounded-lg px-2.5 py-2 text-[13px] font-medium text-ink transition-colors hover:bg-surface-hover"
-                      >
-                        <Users size={15} className="text-ink-subtle" />
-                        {t.nav.team}
-                      </Link>
+                      {canTeam && (
+                        <Link
+                          href="/settings/team"
+                          role="menuitem"
+                          onClick={() => setAccountOpen(false)}
+                          className="flex items-center gap-2 rounded-lg px-2.5 py-2 text-[13px] font-medium text-ink transition-colors hover:bg-surface-hover"
+                        >
+                          <Users size={15} className="text-ink-subtle" />
+                          {t.nav.team}
+                        </Link>
+                      )}
                       <form action="/api/auth/logout" method="post" onSubmit={() => setLoggingOut(true)}>
                         <button
                           type="submit"

@@ -335,7 +335,16 @@ export default function KnowledgePage() {
           ))}
         </div>
         {!loading && docs.length === 0 && (
-          <EmptyState icon={<BookOpen size={26} strokeWidth={1.5} />} title={t.knowledge.emptyTitle} description={t.knowledge.emptyDesc} />
+          <EmptyState
+            icon={<BookOpen size={26} strokeWidth={1.5} />}
+            title={t.knowledge.emptyTitle}
+            description={t.knowledge.emptyDesc}
+            action={
+              <Button size="sm" variant="secondary" onClick={() => document.getElementById("faqs")?.scrollIntoView({ behavior: "smooth" })}>
+                أسرع بداية: سؤال شائع
+              </Button>
+            }
+          />
         )}
       </GlassCard>
 
@@ -388,7 +397,7 @@ export default function KnowledgePage() {
       </GlassCard>
 
       {/* FAQs */}
-      <GlassCard className="space-y-3 p-4 sm:p-5">
+      <GlassCard id="faqs" className="space-y-3 p-4 sm:p-5">
         <h2 className="flex items-center gap-2 text-sm font-bold text-ink">
           <span className="flex h-7 w-7 items-center justify-center rounded-lg bg-sky-500/10 text-sky-600 dark:text-sky-300">
             <MessageCircleQuestion size={15} />
