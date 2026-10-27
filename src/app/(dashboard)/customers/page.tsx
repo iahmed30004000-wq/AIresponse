@@ -139,7 +139,8 @@ export default function CustomersPage() {
 
           <div className="grid gap-3 sm:grid-cols-2 md:hidden">
             {visible.map((c) => (
-              <GlassCard key={c.id} className="p-4 transition-all active:scale-[0.99]">
+              <Link key={c.id} href={`/conversations?q=${encodeURIComponent(c.phone ?? c.name ?? "")}`} className="block">
+              <GlassCard className="p-4 transition-all active:scale-[0.99]">
                 <div className="flex items-center gap-2.5">
                   <Avatar name={c.name ?? c.phone} size="md" />
                   <div className="min-w-0 flex-1">
@@ -154,6 +155,7 @@ export default function CustomersPage() {
                 </div>
                 <p className="mt-2 text-[11px] text-ink-subtle">{t.customer.lastActivity}: {timeAgo(c.lastContactAt ?? c.createdAt)}</p>
               </GlassCard>
+              </Link>
             ))}
           </div>
         </>
