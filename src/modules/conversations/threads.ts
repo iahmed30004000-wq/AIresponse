@@ -2,6 +2,7 @@ import type { Prisma, MessageType, ConversationStatus } from "@prisma/client";
 import { AppError, NotFoundError } from "@/core/errors";
 import { makeEvent, eventBus } from "@/core/events/bus";
 import { recordAudit } from "@/modules/audit/service";
+import { publishRealtime } from "@/modules/realtime/events";
 import { type Db, type ActorContext, type Paginated } from "@/modules/customers/service";
 
 // ---- Guards ----
@@ -390,6 +391,35 @@ export async function postNote(
   return note;
 }
 
+/** يضيف اسم المرسل للعرض الداخلي (بلا أي تغيير على نصوص الرسائل). */
+async function withSenderNames<T extends { senderType: string; senderId?: string | null }>(
+  db: Db,
+  items: T[]
+): Promise<Array<T & { senderName: string | null }>> {
+  const ids = [...new Set(items.filter((m) => m.senderType === "HUMAN" && m.senderId).map((m) => m.senderId as string))];
+  const names = new Map<string, string>();
+  if (ids.length > 0) {
+    try {
+      const users = (await db.user.findMany({
+        where: { id: { in: ids } },
+        select: { id: true, name: true },
+      })) as Array<{ id: string; name: string }>;
+      for (const u of users) names.set(u.id, u.name);
+    } catch {
+      // اسم الموظف تحسين عرض — غيابه ما يوقف الرسائل.
+    }
+  }
+  return items.map((m) => ({
+    ...m,
+    senderName:
+      m.senderType === "AI"
+        ? "الذكاء الاصطناعي"
+        : m.senderType === "HUMAN"
+          ? names.get(m.senderId ?? "") ?? null
+          : null,
+  }));
+}
+
 export async function listMessages(
   db: Db,
   ctx: ActorContext,
@@ -411,7 +441,7 @@ export async function listMessages(
     const page = window.slice(-limit);
     const hasMore = window.length > limit;
     return {
-      items: page,
+      items: await withSenderNames(db, page),
       nextCursor: hasMore && page.length ? page[0].id : null,
     };
   }
@@ -427,7 +457,7 @@ export async function listMessages(
     const hasMore = messages.length > limit;
     const items = hasMore ? messages.slice(0, limit) : messages;
     return {
-      items,
+      items: await withSenderNames(db, items),
       nextCursor: hasMore ? items[items.length - 1].id : null,
     };
   }
@@ -435,7 +465,7 @@ export async function listMessages(
   const page = older.slice(-limit);
   const hasMore = older.length > limit;
   return {
-    items: page,
+    items: await withSenderNames(db, page),
     nextCursor: hasMore && page.length ? page[0].id : null,
   };
 }
@@ -488,6 +518,12 @@ export async function postOutboundMessage(
       senderType: "HUMAN",
     })
   );
+  void publishRealtime(db, {
+    workspaceId: ctx.workspaceId,
+    type: "message.outbound",
+    conversationId,
+    entityId: message.id,
+  });
 
   return message;
 }
@@ -501,6 +537,11 @@ export async function markConversationRead(db: Db, ctx: ActorContext, conversati
     data: { unreadCount: 0 },
   });
   await eventBus.publish(makeEvent("MessageRead", ctx.workspaceId, { conversationId, unreadCount: 0 }));
+  void publishRealtime(db, {
+    workspaceId: ctx.workspaceId,
+    type: "conversation.updated",
+    conversationId,
+  });
   return updated;
 }
 
@@ -509,6 +550,11 @@ export async function markConversationUnread(db: Db, ctx: ActorContext, conversa
   const updated = await db.conversation.update({
     where: { id: conversationId },
     data: { unreadCount: { increment: 1 } },
+  });
+  void publishRealtime(db, {
+    workspaceId: ctx.workspaceId,
+    type: "conversation.updated",
+    conversationId,
   });
   return updated;
 }
@@ -561,6 +607,11 @@ export async function deleteConversation(db: Db, ctx: ActorContext, conversation
   await eventBus.publish(
     makeEvent("ConversationUpdated", ctx.workspaceId, { conversationId, type: "ConversationDeleted" })
   );
+  void publishRealtime(db, {
+    workspaceId: ctx.workspaceId,
+    type: "conversation.updated",
+    conversationId,
+  });
   return updated;
 }
 

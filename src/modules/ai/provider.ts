@@ -12,6 +12,8 @@ export interface TextRequest {
   model?: string;
   temperature?: number;
   maxTokens?: number;
+  /** This call's own limit. Unset = AI_REQUEST_TIMEOUT_MS. Never sent to the model. */
+  timeoutMs?: number;
 }
 
 export interface StructuredRequest<T> extends TextRequest {
@@ -101,10 +103,10 @@ export class OpenAICompatibleProvider implements AIProvider {
     return this.defaultModel;
   }
 
-  private async chat(body: Record<string, unknown>): Promise<AIResponse> {
+  private async chat(body: Record<string, unknown>, requestTimeoutMs?: number): Promise<AIResponse> {
     const started = Date.now();
     // Bounded execution: a hung provider must never hang the worker forever.
-    const timeoutMs = Math.max(1000, parseInt(process.env.AI_REQUEST_TIMEOUT_MS ?? "60000", 10) || 60000);
+    const timeoutMs = requestTimeoutMs ?? Math.max(1000, parseInt(process.env.AI_REQUEST_TIMEOUT_MS ?? "60000", 10) || 60000);
     const controller = new AbortController();
     const timer = setTimeout(() => controller.abort(), timeoutMs);
     let res: Response;
@@ -128,7 +130,8 @@ export class OpenAICompatibleProvider implements AIProvider {
       }
       throw err;
     }
-    clearTimeout(timer);
+    // A call with its own limit stays bounded while the body arrives too.
+    if (requestTimeoutMs === undefined || !res.ok) clearTimeout(timer);
     if (!this.followRedirects && (res.type === "opaqueredirect" || res.status === 0 || (res.status >= 300 && res.status < 400))) {
       throw new AIProviderError(
         `${this.name} endpoint refused: server answered with a redirect (REDIRECT_BLOCKED). Point the endpoint at the final gateway URL — redirects are never followed.`,
@@ -154,10 +157,20 @@ export class OpenAICompatibleProvider implements AIProvider {
         httpStatus: status,
       });
     }
-    const json = (await res.json()) as {
+    let json: {
       choices: { message: { content: string } }[];
       usage?: { prompt_tokens: number; completion_tokens: number };
     };
+    try {
+      json = (await res.json()) as typeof json;
+    } catch (err) {
+      if (err instanceof Error && err.name === "AbortError") {
+        throw new AIProviderError(`${this.name} request timed out after ${timeoutMs}ms`, { retryable: true });
+      }
+      throw err;
+    } finally {
+      clearTimeout(timer);
+    }
     const text = json.choices[0]?.message?.content ?? "";
     if (!text.trim()) {
       throw new AIProviderError(`${this.name} returned an empty response`);
@@ -171,15 +184,18 @@ export class OpenAICompatibleProvider implements AIProvider {
   }
 
   async generateText(req: TextRequest): Promise<AIResponse> {
-    return this.chat({
-      model: req.model ?? this.defaultModel,
-      messages: [
-        { role: "system", content: req.system },
-        { role: "user", content: req.user },
-      ],
-      temperature: req.temperature ?? 0.4,
-      max_tokens: req.maxTokens ?? 500,
-    });
+    return this.chat(
+      {
+        model: req.model?.trim() || this.defaultModel,
+        messages: [
+          { role: "system", content: req.system },
+          { role: "user", content: req.user },
+        ],
+        temperature: req.temperature ?? 0.4,
+        max_tokens: req.maxTokens ?? 500,
+      },
+      req.timeoutMs
+    );
   }
 
   async generateStructured<T>(req: StructuredRequest<T>): Promise<AIResponse & { value: T }> {
@@ -197,7 +213,7 @@ export class OpenAICompatibleProvider implements AIProvider {
 
   async generateVision(req: VisionRequest): Promise<AIResponse> {
     return this.chat({
-      model: req.model ?? this.defaultModel,
+      model: req.model?.trim() || this.defaultModel,
       messages: [
         { role: "system", content: req.system },
         {
@@ -518,4 +534,72 @@ export async function probeProviderEndpoint(
   } finally {
     clearTimeout(timer);
   }
+}
+
+/**
+ * Fast link/auth probe — measures the network round-trip only.
+ *
+ * A full chat-completions probe answers "is the model generating?", but it pays
+ * the model's own latency (seconds). This probe answers "is the endpoint
+ * reachable and is the key accepted?" in ~one RTT:
+ *  - OpenRouter: `GET /api/v1/key` (small JSON) instead of `/models` (≈800 KB).
+ *  - Any OpenAI-compatible endpoint: `GET …/models` (a tiny list for the
+ *    gateway, one request, no generation).
+ *
+ * The result is a connectivity number, NOT a reply-latency number; the UI
+ * labels it accordingly. A 2xx = link + key accepted; 401/403 = key rejected.
+ */
+export async function probeProviderLink(
+  endpointUrl: string,
+  apiKey: string,
+  opts?: { fetchFn?: typeof fetch; timeoutMs?: number }
+): Promise<{ ok: boolean; latencyMs: number; detail: string }> {
+  const started = Date.now();
+  const fetchFn = opts?.fetchFn ?? fetch;
+  const timeoutMs = opts?.timeoutMs ?? 4000;
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), timeoutMs);
+  const url = linkProbeUrl(endpointUrl);
+  const headers: Record<string, string> = { Accept: "application/json" };
+  if (apiKey) headers.Authorization = `Bearer ${apiKey}`;
+  try {
+    const res = await fetchFn(url, {
+      method: "GET",
+      headers,
+      signal: controller.signal,
+      redirect: "manual",
+    });
+    // Drain nothing: these payloads are small; aborting keeps the socket free.
+    // 404/405 means the server answered but has no `/models` route (some
+    // gateways) — that still proves the link, so it is not a failure.
+    const reachable = res.ok || res.status === 404 || res.status === 405;
+    const detail = res.ok
+      ? "LINK_OK"
+      : res.status === 401 || res.status === 403
+        ? `AUTH_REJECTED_${res.status}`
+        : res.status === 404 || res.status === 405
+          ? "LINK_OK_NO_MODELS_ROUTE"
+          : `HTTP_${res.status}`;
+    return { ok: reachable, latencyMs: Date.now() - started, detail };
+  } catch (err) {
+    return { ok: false, latencyMs: Date.now() - started, detail: (err instanceof Error ? err.message : String(err)).slice(0, 200) };
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+/** Derives the cheapest endpoint that proves reachability (+ auth when available). */
+export function linkProbeUrl(endpointUrl: string): string {
+  const url = endpointUrl.trim();
+  let host = "";
+  try {
+    host = new URL(url).host;
+  } catch {
+    host = "";
+  }
+  if (host === "openrouter.ai") return "https://openrouter.ai/api/v1/key";
+  const base = url.replace(/\/+$/, "");
+  if (/\/chat\/completions$/.test(base)) return base.replace(/\/chat\/completions$/, "/models");
+  if (/\/v1$/.test(base)) return `${base}/models`;
+  return `${base}/v1/models`;
 }

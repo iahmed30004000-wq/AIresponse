@@ -3,6 +3,7 @@ import { makeEvent, eventBus } from "@/core/events/bus";
 import { recordAudit } from "@/modules/audit/service";
 import { resolveCustomerByChannelIdentity, type Db } from "@/modules/customers/service";
 import { childLogger } from "@/core/logger";
+import { publishRealtime } from "@/modules/realtime/events";
 
 // ---- Incoming pipeline (AI hooks in Phase 4 at the documented point) ----
 
@@ -178,6 +179,9 @@ export async function processIncomingMessage(db: Db, input: IncomingMessageInput
     pageSendMode = page ? ((page as { sendMode?: string }).sendMode ?? "AUTO_REPLY") : "UNKNOWN";
   } catch (err) {
     childLogger("pipeline").error({ err, conversationId: conversation.id }, "send_mode_lookup_failed");
+    // ما منبلعها: قراءة فاشلة كانت بتخلّي الوضع UNKNOWN، فلا رد ولا سجل ولا
+    // إعادة محاولة — رسالة زبون بتضيع بصمت. منرمي ليعيد الطابور المحاولة.
+    throw err;
   }
 
   // Idempotency: externalEventId (delivery retries) then externalMessageId.
@@ -275,6 +279,14 @@ export async function processIncomingMessage(db: Db, input: IncomingMessageInput
     data: { lastContactAt: now },
   });
 
+  // Realtime: رسالة الزبون تظهر عند الوكيل فورًا (بلا تحديث الصفحة).
+  void publishRealtime(db, {
+    workspaceId: input.workspaceId,
+    type: "message.inbound",
+    conversationId: conversation.id,
+    entityId: message.id,
+  });
+
   // P12 — الإسناد (إعلان/رمز) وإلغاء الاشتراك بكلمة صريحة — بعد الحفظ،
   // ولا يوقف الرسالة أبدًا (الفشل يُسجّل فقط).
   try {
@@ -327,38 +339,60 @@ export async function processIncomingMessage(db: Db, input: IncomingMessageInput
   const sendMode: "AUTO_REPLY" | "COLLECTION_ONLY" | "UNKNOWN" =
     pageSendMode === "COLLECTION_ONLY" || pageSendMode === "AUTO_REPLY" ? pageSendMode : "UNKNOWN";
 
-  if (sendMode === "COLLECTION_ONLY") {
+  // ── مهمة استخراج بيانات العميل = مستقلة تمامًا عن مسار الرد ──
+  // تُصفّ في وضع الردّ (AUTO_REPLY) ووضع التجميع (COLLECTION_ONLY): لا تُرسل
+  // شيئًا للعميل أبدًا، وفشلها لا يؤخّر الرد ولا يفقد الرسالة.
+  const enqueueCustomerIntel = async () => {
     try {
       const { enqueueJob } = await import("@/modules/jobs/service");
       await enqueueJob(db, {
         workspaceId: input.workspaceId,
         type: "extract_customer_intel",
         payload: { conversationId: conversation.id, messageId: message.id },
-        // معرّف واحد لكل رسالة: تكرار الـ Webhook ما بيحلّل مرتين.
+        // معرّف واحد لكل رسالة: تكرار الـ Webhook أو إعادة التشغيل ما بيحلّل مرتين.
         idempotencyKey: `intel:${message.id}`,
       });
     } catch (err) {
       // الرسالة محفوظة دائمًا — إعادة التحليل متاحة لاحقًا من المختبر.
       childLogger("pipeline").error({ err, messageId: message.id }, "intel_job_enqueue_failed");
     }
-  } else if (sendMode === "AUTO_REPLY" && conversation.aiState === "AI_ACTIVE" && conversation.aiEnabled) {
-    // Enqueue AI processing (Phase 4) — the webhook never waits for the AI.
-    // Gating: conversation must be AI_ACTIVE; a failed enqueue never loses the
-    // message (persisted above and retryable via /api/jobs/run scanning).
-    try {
-      const { enqueueJob } = await import("@/modules/jobs/service");
-      await enqueueJob(db, {
-        workspaceId: input.workspaceId,
-        type: "process_ai_message",
-        payload: { conversationId: conversation.id, messageId: message.id },
-        // Deterministic active-job idempotency (partial unique index):
-        // webhook redelivery or a sweeper race can never create two ACTIVE
-        // AI jobs for the same inbound message.
-        idempotencyKey: `ai:${message.id}`,
-      });
-    } catch (err) {
-      childLogger("pipeline").error({ err }, "ai_job_enqueue_failed");
+  };
+
+  if (sendMode === "COLLECTION_ONLY") {
+    await enqueueCustomerIntel();
+  } else if (sendMode === "AUTO_REPLY") {
+    // ١) الرد أولًا إن كانت المحادثة للذكاء — لا ينتظر استخراج بيانات العميل.
+    if (conversation.aiState === "AI_ACTIVE" && conversation.aiEnabled) {
+      // Enqueue AI processing (Phase 4) — the webhook never waits for the AI.
+      // Gating: conversation must be AI_ACTIVE; a failed enqueue never loses the
+      // message (persisted above and retryable via /api/jobs/run scanning).
+      const queueAiJob = async () => {
+        const { enqueueJob } = await import("@/modules/jobs/service");
+        await enqueueJob(db, {
+          workspaceId: input.workspaceId,
+          type: "process_ai_message",
+          payload: { conversationId: conversation.id, messageId: message.id },
+          // Deterministic active-job idempotency (partial unique index):
+          // webhook redelivery or a sweeper race can never create two ACTIVE
+          // AI jobs for the same inbound message.
+          idempotencyKey: `ai:${message.id}`,
+        });
+      };
+      try {
+        await queueAiJob();
+      } catch (err) {
+        // محاولة تانية فورًا: عثرة لحظية بقاعدة البيانات كانت بتترك الرسالة
+        // بلا مهمة رد، وما بينقذها غير الكنس (وبعد ٧٢ ساعة بتضيع).
+        childLogger("pipeline").warn({ err }, "ai_job_enqueue_retry");
+        try {
+          await queueAiJob();
+        } catch (retryErr) {
+          childLogger("pipeline").error({ err: retryErr }, "ai_job_enqueue_failed");
+        }
+      }
     }
+    // ٢) استخراج بيانات العميل بالخلفية (مهمة منفصلة، بلا إرسال).
+    await enqueueCustomerIntel();
   }
 
   return {

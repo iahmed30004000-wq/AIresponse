@@ -1,7 +1,8 @@
+import { customerFacingPriceTiers } from "@/modules/products/price-tiers";
 import type { KnowledgeCategory } from "@prisma/client";
 import { NotFoundError } from "@/core/errors";
 import type { Db } from "@/modules/customers/service";
-import { retrieveKnowledge, type VectorStore } from "@/modules/knowledge/retriever";
+import { retrieveKnowledge, type VectorMatch, type VectorStore } from "@/modules/knowledge/retriever";
 import { getApprovedFeedbackForProduct } from "@/modules/feedback/service";
 import { excludeCustomerInbound, findProductMedia, findRelevantMedia } from "@/modules/media/service";
 
@@ -111,9 +112,14 @@ export async function buildProductContext(db: Db, workspaceId: string, productId
       objections: product.objections,
       salesNotes: product.salesNotes,
       faqs: product.faqs.map((f) => ({ id: f.id, question: f.question, answer: f.answer })),
-      priceTiers: ((product as unknown as { priceTiers?: { label: string; price: string }[] }).priceTiers ?? []).map(
-        (t) => ({ label: t.label, price: t.price.toString() })
-      ),
+      // Wholesale and distributor prices must never be quoted to retail customers.
+      // منتج من الـ OMS: السعر والعروض من الـ OMS بس — أسعار مسمّاة قديمة
+      // عندنا ما بتنقال (الـ OMS كان رح يعيد التسعير ويطلع غير اللي انوعد فيه).
+      priceTiers: (product as unknown as { syncedFromOms?: boolean }).syncedFromOms
+        ? []
+        : customerFacingPriceTiers(
+            (product as unknown as { priceTiers?: { label: string; price: string }[] }).priceTiers ?? []
+          ).map((t) => ({ label: t.label, price: t.price.toString() })),
       ...(compliance ? { compliance } : {}),
     } as AIContext["product"],
     citations: [
@@ -129,7 +135,16 @@ export async function buildProductContext(db: Db, workspaceId: string, productId
 export async function buildKnowledgeContext(
   db: Db,
   vectorStore: VectorStore,
-  params: { workspaceId: string; query: string; productId?: string; category?: KnowledgeCategory; limit?: number }
+  params: {
+    workspaceId: string;
+    query: string;
+    productId?: string;
+    category?: KnowledgeCategory;
+    limit?: number;
+    /** P18 — حدود كتالوج الصفحة على الأسئلة الجاهزة/المعرفة. */
+    allowedProductIds?: string[] | null;
+    preloadedChunks?: Promise<VectorMatch[]>;
+  }
 ) {
   const result = await retrieveKnowledge(db, vectorStore, params);
   return {
@@ -175,8 +190,12 @@ export async function buildFeedbackContext(
 
 export async function buildMediaContext(
   db: Db,
-  params: { workspaceId: string; productId?: string; query?: string; limit?: number }
+  params: { workspaceId: string; productId?: string; query?: string; limit?: number; allowedProductIds?: string[] | null }
 ) {
+  // صفحة بكتالوج وبلا منتج محدد: البحث العام بيجيب وسائط أي منتج بالمساحة.
+  if (!params.productId && params.allowedProductIds) {
+    return { media: [] as AIContext["media"], citations: [] as Citation[] };
+  }
   const assets = params.productId
     ? await findProductMedia(db, params.workspaceId, params.productId, params.limit ?? 3)
     : await findRelevantMedia(db, {
@@ -200,6 +219,10 @@ export async function buildAIContext(
     query: string;
     productId?: string;
     knowledgeLimit?: number;
+    /** P18 — undefined = ما في كتالوجات (بلا تقييد) · [] = لا منتجات متاحة. */
+    allowedProductIds?: string[] | null;
+    /** Document search the caller already started (see runExtraction). */
+    preloadedChunks?: Promise<VectorMatch[]>;
   }
 ): Promise<AIContext> {
   const [productCtx, knowledgeCtx, feedbackCtx, mediaCtx] = await Promise.all([
@@ -211,6 +234,8 @@ export async function buildAIContext(
       query: params.query,
       productId: params.productId,
       limit: params.knowledgeLimit ?? 4,
+      allowedProductIds: params.allowedProductIds,
+      preloadedChunks: params.preloadedChunks,
     }),
     params.productId
       ? buildFeedbackContext(db, params.workspaceId, params.productId)
@@ -220,6 +245,7 @@ export async function buildAIContext(
       productId: params.productId,
       query: params.query,
       limit: 3,
+      allowedProductIds: params.allowedProductIds,
     }),
   ]);
 

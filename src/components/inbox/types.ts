@@ -44,6 +44,8 @@ export type MessageItem = {
   /** P4: internal team note — rendered distinctly, never sent or retried. */
   isNote?: boolean;
   senderId?: string | null;
+  /** اسم مرسل الرسالة (الموظف أو الذكاء) — للعرض الداخلي فقط. */
+  senderName?: string | null;
 };
 
 export type CustomerDetail = {
@@ -90,6 +92,10 @@ export type DraftInfo = {
   rawAddress: string | null;
   province: string | null;
   missingFields: string[];
+  /** P19 — الحقول المطلوبة حسب صفحة المحادثة. */
+  requiredFields?: string[];
+  /** P22 — سلة متعددة المنتجات. */
+  items?: { productId?: string | null; productName?: string | null; quantity?: number | null }[];
 };
 
 export const CHANNEL_LABELS: Record<string, string> = {

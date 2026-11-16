@@ -87,6 +87,13 @@ export interface ExtractionReady {
   extractionUser: string;
   /** P8 — خطة بيع حتمية (أرقام من DB فقط)؛ اختيارية ولا تغير السلوك غيابًا. */
   salesPlan?: import("@/modules/sales/plan-schemas").SalesPlan;
+  /**
+   * P18 — حدود كتالوج الصفحة (أسماء المنتجات المسموحة فقط).
+   * undefined = ما في كتالوجات بالمساحة (السلوك القديم) · نص = حدّ صريح للرد.
+   */
+  catalogBoundary?: string;
+  /** أسماء منتجات خارج كتالوج الصفحة لفلترة نص الموديل؛ null = بلا كتالوجات. */
+  recallGuard?: import("../catalog-boundary").RecallGuard | null;
 }
 
 export type { Db };

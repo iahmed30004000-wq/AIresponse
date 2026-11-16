@@ -1,6 +1,7 @@
 import { childLogger } from "@/core/logger";
 import { decryptSecret } from "@/core/crypto";
 import { AppError } from "@/core/errors";
+import { publishRealtime } from "@/modules/realtime/events";
 import { getFacebookClient } from "./facebook/client";
 import { FacebookApiError } from "./facebook/types";
 import { FacebookChannelAdapter } from "./facebook/adapter";
@@ -22,6 +23,7 @@ import { getWhatsAppClient, WhatsAppApiError } from "./whatsapp/client";
 import { getTikTokClient, TikTokApiError } from "./tiktok/client";
 import { InstagramApiError } from "./instagram/client";
 import { generatePublicMediaUrl } from "@/modules/media/service";
+import { ALREADY_SENT } from "./delivery-status";
 import type { Db } from "@/modules/customers/service";
 import type { ChannelType } from "@prisma/client";
 
@@ -40,7 +42,14 @@ export interface DispatchOutboundParams {
   /** Inbound message this reply answers — part of the idempotency identity. */
   sourceMessageId: string;
   text: string;
-  senderType?: "AI" | "HUMAN";
+  senderType?: "AI" | "HUMAN" | "SYSTEM";
+  /**
+   * Phase 2 — the REAL automated source used by the final send guard. Never
+   * "HUMAN"; lets a campaign/automation/follow-up be classified honestly
+   * instead of masquerading as a human to bypass the human-takeover guard.
+   * Defaults to `senderType ?? "AI"`.
+   */
+  automationSource?: "AI" | "AUTOMATION" | "FOLLOWUP" | "CAMPAIGN" | "SYSTEM";
   senderId?: string;
   /** Optional media asset ID to attach (image/video/audio/file). */
   mediaId?: string | null;
@@ -59,8 +68,6 @@ export interface DispatchOutboundParams {
   template?: { name: string; language: string; variables?: Record<string, string> } | null;
 }
 
-/** حالات «الرسالة طلعت فعلًا» — نهائية لعدم التكرار (SENT وما بعده من إشارات التسليم). */
-const ALREADY_SENT = new Set(["SENT", "DELIVERED", "READ"]);
 
 export interface DispatchOutboundResult {
   messageId: string;
@@ -166,7 +173,8 @@ export async function dispatchOutbound(
   params: DispatchOutboundParams
 ): Promise<DispatchOutboundResult> {
   const started = Date.now();
-  if (!params.text?.trim()) {
+  // صورة بلا نص مسموحة (الصور الإضافية بطلب «ابعتلي صور»)؛ الفراغ التام لأ.
+  if (!params.text?.trim() && !params.mediaId) {
     return { messageId: "", deliveryStatus: "FAILED", error: "تعذر إرسال الرد — نص فارغ" };
   }
 
@@ -177,7 +185,7 @@ export async function dispatchOutbound(
   const sendPolicy = await assertAutomatedSendAllowed(db as never, {
     workspaceId: params.workspaceId,
     conversationId: params.conversationId,
-    senderType: params.senderType ?? "AI",
+    senderType: params.automationSource ?? params.senderType ?? "AI",
   });
   if (!sendPolicy.allowed) {
     return {
@@ -186,7 +194,9 @@ export async function dispatchOutbound(
       error:
         sendPolicy.reason === "COLLECTION_ONLY"
           ? "COLLECTION_ONLY: الرد الآلي معطّل — الصفحة في وضع التجميع (جمع وتحليل فقط)"
-          : "SEND_MODE_UNKNOWN: تعذّر التحقق من وضع الصفحة — أُوقف الإرسال الآلي احتياطًا",
+          : sendPolicy.reason === "HUMAN_ACTIVE"
+            ? "HUMAN_ACTIVE: الموظف مسيطر على المحادثة — أُوقف الإرسال الآلي"
+            : "SEND_MODE_UNKNOWN: تعذّر التحقق من وضع الصفحة — أُوقف الإرسال الآلي احتياطًا",
     };
   }
 
@@ -224,6 +234,24 @@ export async function dispatchOutbound(
     ...(priorPart1ForClaim ? { part1MessageId: priorPart1ForClaim } : {}),
   };
   const hasClaimMetadata = Object.keys(claimMetadata).length > 0;
+  // Phase 3 — real reply latency: the wait between the customer's inbound and
+  // this outbound. Best-effort, recorded on the row; synthetic sources
+  // (campaign:… / followup:…) have no inbound row and stay null — never invented.
+  const respondedAt = new Date();
+  let replyLatencyMs: number | null = null;
+  if (!existing) {
+    try {
+      const source = await (db as any).message.findUnique({
+        where: { id: params.sourceMessageId },
+        select: { direction: true, createdAt: true },
+      });
+      if (source && source.direction === "INBOUND") {
+        replyLatencyMs = Math.max(0, respondedAt.getTime() - new Date(source.createdAt).getTime());
+      }
+    } catch {
+      // measurement never blocks the send.
+    }
+  }
   let message;
   try {
     if (existing) {
@@ -244,10 +272,13 @@ export async function dispatchOutbound(
           senderType: params.senderType ?? "AI",
           senderId: params.senderId ?? "ai-agent",
           direction: "OUTBOUND",
-          type: "TEXT",
+          // A media-only row has no words: the inbox labels it as an attachment.
+          type: params.text?.trim() ? "TEXT" : "IMAGE",
           text: params.text,
           provider: "facebook",
           deliveryStatus: "PENDING",
+          respondedAt,
+          ...(replyLatencyMs != null ? { replyLatencyMs } : {}),
           outboundIdempotencyKey: outboundKey,
           ...(hasClaimMetadata ? { metadata: claimMetadata } : {}),
         },
@@ -293,6 +324,13 @@ export async function dispatchOutbound(
     { messageId: message.id, conversationId: params.conversationId, provider: "facebook" },
     "facebook_outbound_started"
   );
+  // Realtime: الفقاعة تظهر عند الوكيل فورًا (الحالة PENDING ثم SENT).
+  void publishRealtime(db, {
+    workspaceId: params.workspaceId,
+    type: "message.outbound",
+    conversationId: params.conversationId,
+    entityId: message.id,
+  });
 
   // 3. Load channel + account + recipient from trusted state.
   // Any unexpected throw below must FAIL the row (never leave PENDING forever —
@@ -435,6 +473,15 @@ export async function dispatchOutbound(
     }
   }
 
+  // A media-only send whose attachment was skipped has nothing left to send:
+  // the text-only fallback above would be sendText("").
+  if (!attachment && !params.text?.trim()) {
+    const reason = mediaSkipped ?? "MEDIA_NOT_AVAILABLE";
+    await markFailed(db, message.id, reason, "تعذر إرسال الصورة", { mediaSkipped: reason });
+    log.warn({ ...ctx, recipientId, status: "FAILED", reason, durationMs: Date.now() - started }, "facebook.message.failed");
+    return { messageId: message.id, deliveryStatus: "FAILED", error: reason, channelId: ctx.channelId, pageId: ctx.pageId, recipientId, durationMs: Date.now() - started };
+  }
+
   // The id that actually travels from here on: a skipped attachment must
   // not be recorded as sent — the next reply would treat it as delivered
   // and never show it.
@@ -563,6 +610,12 @@ export async function dispatchOutbound(
       where: { id: params.conversationId },
       data: { lastAgentMessageAt: new Date() },
     });
+    void publishRealtime(db, {
+      workspaceId: params.workspaceId,
+      type: "message.outbound",
+      conversationId: params.conversationId,
+      entityId: message.id,
+    });
     try {
       const { incrementUsage } = await import("@/core/analytics/usage-service");
       await incrementUsage(db as never, params.workspaceId, { messagesOutbound: 1 });
@@ -619,13 +672,20 @@ export async function dispatchOutbound(
   }
 }
 
-async function markFailed(db: Db, messageId: string, reason: string, arabicMessage?: string) {
+async function markFailed(
+  db: Db,
+  messageId: string,
+  reason: string,
+  arabicMessage?: string,
+  extraMetadata: Record<string, string> = {}
+) {
   await db.message.update({
     where: { id: messageId },
     data: {
       deliveryStatus: "FAILED",
       deliveryError: arabicMessage ? `${reason}: ${arabicMessage}` : reason,
       metadata: {
+        ...extraMetadata,
         providerErrorCode: reason,
         providerErrorMessage: arabicMessage ?? reason,
         failedAt: new Date().toISOString(),
@@ -800,6 +860,12 @@ async function dispatchChannelSend(db: Db, s: ChannelSendContext): Promise<Dispa
     await db.conversation.update({
       where: { id: s.params.conversationId },
       data: { lastAgentMessageAt: new Date() },
+    });
+    void publishRealtime(db, {
+      workspaceId: s.params.workspaceId,
+      type: "message.outbound",
+      conversationId: s.params.conversationId,
+      entityId: s.messageId,
     });
     try {
       const { incrementUsage } = await import("@/core/analytics/usage-service");

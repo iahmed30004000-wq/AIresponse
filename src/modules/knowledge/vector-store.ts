@@ -21,9 +21,17 @@ export interface VectorQuery {
   documentId?: string;
   /** Extra equality filters stored in chunk metadata. */
   metadataFilters?: Record<string, string>;
+  /** Documents this search must not return. */
+  excludeDocumentIds?: string[];
 }
 
 export interface VectorStore {
+  /**
+   * Number of vectors the store holds, when the implementation can answer it
+   * cheaply. `0` means semantic search cannot return anything, so callers may
+   * skip the embedding call entirely. `undefined` = unknown (must search).
+   */
+  readonly size?: number;
   search(query: VectorQuery): Promise<VectorMatch[]>;
 }
 
@@ -51,6 +59,10 @@ export class InMemoryVectorStore implements VectorStore {
     private rows: Map<string, Omit<VectorMatch, "chunkId" | "score"> & { workspaceId: string; metadata: Record<string, unknown>; isActive: boolean; embeddingProvider?: string; embeddingModel?: string; embeddingDimensions?: number }>
   ) {}
 
+  get size(): number {
+    return this.vectors.size;
+  }
+
   async search(query: VectorQuery): Promise<VectorMatch[]> {
     const limit = query.limit ?? 5;
     const filter = getEmbeddingFilter();
@@ -60,6 +72,7 @@ export class InMemoryVectorStore implements VectorStore {
       if (!row || !row.isActive) continue;
       if (row.workspaceId !== query.workspaceId) continue;
       if (query.documentId && row.documentId !== query.documentId) continue;
+      if (query.excludeDocumentIds?.includes(row.documentId)) continue;
       // Filter by embedding generation to prevent mixing incompatible vectors
       if (row.embeddingProvider !== filter.provider || row.embeddingModel !== filter.model || row.embeddingDimensions !== filter.dimensions) {
         continue;
@@ -103,6 +116,14 @@ export class PgVectorStore implements VectorStore {
     if (query.documentId) {
       params.push(query.documentId);
       sql += ` AND c."documentId" = $${params.length}`;
+    }
+    if (query.excludeDocumentIds?.length) {
+      params.push(query.excludeDocumentIds);
+      sql += ` AND NOT (c."documentId" = ANY($${params.length}::text[]))`;
+    }
+    for (const [key, value] of Object.entries(query.metadataFilters ?? {})) {
+      params.push(key, value);
+      sql += ` AND c.metadata->>$${params.length - 1}::text = $${params.length}::text`;
     }
     sql += ` ORDER BY c.embedding <=> $1::vector LIMIT $6`;
     const rows = await this.queryFn(sql, params);

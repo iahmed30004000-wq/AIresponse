@@ -1,8 +1,8 @@
 "use client";
 
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import Link from "next/link";
-import { ArrowLeft, ArrowLeftRight, Bot, Hand, MessagesSquare, Receipt, Sparkles, TrendingUp, Users, Workflow } from "lucide-react";
+import { ArrowLeft, ArrowLeftRight, Bot, Hand, MessagesSquare, Receipt, Sparkles, TrendingUp, Users } from "lucide-react";
 import { formatNumber, t } from "@/lib/i18n";
 import { TIMEZONE_OPTIONS } from "@/lib/timezones";
 import { Button } from "@/components/ui/button";
@@ -12,6 +12,7 @@ import { Skeleton } from "@/components/ui/skeleton";
 import { StatCard } from "@/components/ui/stat-card";
 import { EmptyState } from "@/components/ui/empty-state";
 import { SetupChecklist } from "@/components/setup-checklist";
+import { useRealtime } from "@/components/realtime/use-realtime";
 
 type Overview = {
   conversations: { total: number; active: number; resolved: number };
@@ -92,6 +93,15 @@ export default function DashboardPage() {
   useEffect(() => {
     load();
   }, [load]);
+
+  // لحظي مع تهدئة: الأرقام تتحدّث عند وصول رسالة/طلب، بحد أقصى كل 15 ثانية.
+  const lastLive = useRef(0);
+  useRealtime(() => {
+    const now = Date.now();
+    if (now - lastLive.current < 15000) return;
+    lastLive.current = now;
+    void load();
+  });
 
   const conversion =
     data && data.messages.inbound > 0 && data.conversations.total > 0
@@ -189,13 +199,6 @@ export default function DashboardPage() {
             <Section title="الدعم البشري" icon={<ArrowLeftRight size={15} />} link="/handoffs">
               <MiniStat label="إجمالي التحويلات" value={formatNumber(data.handoffs.total)} tone="brand" />
               <MiniStat label="متوسط زمن الحل (دقيقة)" value={formatNumber(data.handoffs.avgResolutionMinutes)} tone="sky" />
-            </Section>
-
-            <Section title="الأتمتة" icon={<Workflow size={15} />} link="/automation">
-              <MiniStat label="تنفيذات" value={formatNumber(data.automation.executions)} tone="brand" />
-              <MiniStat label="ناجحة" value={formatNumber(data.automation.completed)} tone="emerald" />
-              <MiniStat label="فاشلة" value={formatNumber(data.automation.failed)} tone="red" />
-              <MiniStat label="متجاوزة" value={formatNumber(data.automation.skipped)} tone="amber" />
             </Section>
           </div>
         </div>

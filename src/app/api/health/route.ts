@@ -2,13 +2,17 @@ import { NextResponse } from "next/server";
 import { prisma } from "@/core/db/prisma";
 import { getEnv } from "@/core/env";
 import { childLogger } from "@/core/logger";
+import { evaluateWorkerHealth } from "@/modules/jobs/worker-health";
 
 const log = childLogger("health");
+
+/** نافذة «الفشل الحالي»: اللي صار اليوم، مش تاريخ النظام كله. */
+const RECENT_FAILURE_WINDOW_MS = 24 * 60 * 60 * 1000;
 
 /**
  * GET /api/health — operational health, no secrets.
  * Distinguishes: APP_HEALTHY / DB_UNHEALTHY / QUEUE_UNHEALTHY /
- * FACEBOOK_CONFIGURATION_MISSING.
+ * WORKER_STALE / FACEBOOK_CONFIGURATION_MISSING.
  */
 export async function GET() {
   const status: Record<string, string> = {};
@@ -26,14 +30,55 @@ export async function GET() {
 
   // Queue depth (only meaningful if DB is reachable)
   if (status.database === "APP_HEALTHY") {
+    const staleRaw = Number(process.env.WORKER_STALE_MS ?? 120_000);
+    const staleMs = Number.isFinite(staleRaw) && staleRaw >= 5_000 ? staleRaw : 120_000;
     try {
-      const failed = await prisma.backgroundJob.count({ where: { status: "FAILED" } });
+      // ⚠️ كان: عدّ كل الفشل من يوم ما اشتغل النظام — ٣٤٨٣ مهمة قديمة بتخلّي
+      // الحالة «غير سليمة» للأبد، فالمؤشر ما بيميّز عطل اليوم عن عطل الشهر الماضي.
+      // 🔧 هلأ: فشل آخر ٢٤ ساعة بس — رقم بيتحرّك وبيدلّ على الوضع الحالي.
+      const failedSince = new Date(Date.now() - RECENT_FAILURE_WINDOW_MS);
+      const failed = await prisma.backgroundJob.count({
+        where: { status: "FAILED", finishedAt: { gte: failedSince } },
+      });
+      const failedAllTime = await prisma.backgroundJob.count({ where: { status: "FAILED" } });
+      status.failedJobsAllTime = String(failedAllTime);
       const pending = await prisma.backgroundJob.count({ where: { status: "PENDING" } });
-      status.queue = failed > 50 ? "QUEUE_UNHEALTHY" : "APP_HEALTHY";
+      // عمر أقدم مهمة معلّقة = مقياس «هل الردود متأخرة؟»
+      const oldest = await prisma.backgroundJob.findFirst({
+        where: { status: "PENDING" },
+        orderBy: { createdAt: "asc" },
+        select: { createdAt: true },
+      });
+      const oldestAgeSec = oldest ? Math.max(0, Math.floor((Date.now() - oldest.createdAt.getTime()) / 1000)) : 0;
+      status.queue = failed > 50 || oldestAgeSec > 120 ? "QUEUE_UNHEALTHY" : "APP_HEALTHY";
       status.queueDepth = String(pending);
       status.failedJobs = String(failed);
+      status.oldestJobAgeSec = String(oldestAgeSec);
+      if (status.queue === "QUEUE_UNHEALTHY") httpStatus = 503;
     } catch {
       status.queue = "QUEUE_UNHEALTHY";
+    }
+
+    // المرحلة ٣ — صحة العامل من أحدث نبضة. متوقف = 503 + تنبيه باللوج.
+    try {
+      const heartbeat = await prisma.workerHeartbeat.findFirst({
+        orderBy: { lastCycleAt: "desc" },
+        select: { lastCycleAt: true, workerId: true },
+      });
+      // عدد العمال الأحياء (نبضة حديثة) — للتوسّع الأفقي.
+      const workers = await prisma.workerHeartbeat.count({
+        where: { lastCycleAt: { gte: new Date(Date.now() - staleMs) } },
+      });
+      status.workers = String(workers);
+      const health = evaluateWorkerHealth(heartbeat?.lastCycleAt ?? null, Date.now(), staleMs);
+      status.worker = health.status;
+      if (health.ageMs != null) status.workerAgeMs = String(health.ageMs);
+      if (health.status === "WORKER_STALE") {
+        httpStatus = 503;
+        log.error({ ageMs: health.ageMs, workerId: heartbeat?.workerId }, "health_worker_stale");
+      }
+    } catch {
+      status.worker = "WORKER_UNKNOWN";
     }
   }
 
@@ -41,8 +86,11 @@ export async function GET() {
   const env = getEnvSafe();
   status.facebook = env.META_APP_ID && env.META_APP_SECRET ? "APP_HEALTHY" : "FACEBOOK_CONFIGURATION_MISSING";
 
+  const healthy = Object.values(status).every(
+    (v) => v === "APP_HEALTHY" || v === "FACEBOOK_CONFIGURATION_MISSING" || v === "WORKER_UNKNOWN"
+  );
   return NextResponse.json(
-    { status: Object.values(status).every((v) => v === "APP_HEALTHY" || v === "FACEBOOK_CONFIGURATION_MISSING") ? "APP_HEALTHY" : "DEGRADED", checks: status },
+    { status: healthy && httpStatus === 200 ? "APP_HEALTHY" : "DEGRADED", checks: status },
     { status: httpStatus }
   );
 }

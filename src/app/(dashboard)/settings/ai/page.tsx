@@ -14,6 +14,11 @@ import { GlassCard, PageHeader } from "@/components/ui/card";
 import { providerLabel, publicDetail } from "@/lib/provider-labels";
 import { GLM_ZAKIAI_PRESET, aiConnectionMode } from "@/lib/ai-connection";
 import { AiStatusCard, TASK_AR, type TaskInfo } from "./ai-status-card";
+import { WhyNoReplyCard } from "./why-no-reply-card";
+import { RiskNote, FixNote } from "@/components/integrations/ui";
+
+/** طھط­طھ ظ‡ط§ظ„ط­ط¯ ط§ظ„ط±ط¯ ط§ظ„ط¹ط±ط¨ظٹ ط¨ظٹظ†ظ‚ط·ط¹ â€” ط§ظ„ظ‚ظٹط§ط³ ظ…ظ† ظ…ط³ط§ط­ط© ط­ظ‚ظٹظ‚ظٹط©: ظ،ظ ظ  ظˆط­ط¯ط© = ظ¢ظ§ ط­ط±ظپ. */
+const SAFE_ARABIC_MAX_TOKENS = 300;
 
 type Settings = {
   provider: string;
@@ -57,10 +62,12 @@ const blank = (value: string | null | undefined) => {
 /** فحص اتصال حي للمزوّد المحفوظ — ping خفيف بلا أي بيانات زبون. */
 function LiveProbe({ provider }: { provider: string }) {
   const [state, setState] = useState<"idle" | "loading" | "ok" | "fail">("idle");
+  const [mode, setMode] = useState<"link" | "generate">("link");
   const [message, setMessage] = useState<string | null>(null);
   const [latency, setLatency] = useState<number | null>(null);
 
-  async function run() {
+  async function run(next: "link" | "generate") {
+    setMode(next);
     setState("loading");
     setMessage(null);
     setLatency(null);
@@ -68,7 +75,7 @@ function LiveProbe({ provider }: { provider: string }) {
       const res = await fetch("/api/ai/providers/test", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ provider }),
+        body: JSON.stringify({ provider, mode: next }),
       });
       const data = (await res.json()) as { status?: string; detail?: string; latencyMs?: number };
       if (!res.ok) throw new Error();
@@ -95,12 +102,17 @@ function LiveProbe({ provider }: { provider: string }) {
 
   return (
     <div className="flex flex-wrap items-center gap-2">
-      <Button type="button" variant="secondary" size="sm" onClick={run} loading={state === "loading"} disabled={state === "loading"}>
+      <Button type="button" variant="secondary" size="sm" onClick={() => run("link")} loading={state === "loading" && mode === "link"} disabled={state === "loading"}>
         فحص الاتصال
+      </Button>
+      <Button type="button" variant="ghost" size="sm" onClick={() => run("generate")} loading={state === "loading" && mode === "generate"} disabled={state === "loading"}>
+        فحص التوليد
       </Button>
       {state === "ok" && (
         <Badge tone="DELIVERED" dot>
-          متصل{latency !== null ? ` · ${latency}ms` : ""}
+          {mode === "link"
+            ? `متصل · ${latency ?? 0}ms`
+            : `التوليد شغّال · ${((latency ?? 0) / 1000).toFixed(1)}s`}
         </Badge>
       )}
       {state === "fail" && (
@@ -108,6 +120,9 @@ function LiveProbe({ provider }: { provider: string }) {
           {message ?? "فشل الاتصال"}
         </Badge>
       )}
+      <span className="text-[10px] text-ink-subtle">
+        {mode === "link" ? "زمن الشبكة والمفتاح" : "زمن توليد ٥ توكنات — مش زمن الرد الحقيقي"}
+      </span>
     </div>
   );
 }
@@ -329,6 +344,8 @@ export default function AISettingsPage() {
 
       <AiStatusCard key={statusKey} onTasks={setTasks} />
 
+      <WhyNoReplyCard />
+
       <Section
         icon={<Power size={15} />}
         title="التشغيل"
@@ -473,7 +490,12 @@ export default function AISettingsPage() {
               className="num"
             />
           </Field>
-          <Field label="أقصى طول للرد" hint="بالتوكنز — كل ١٠٠ ≈ ٧٠ كلمة">
+          {/* ⚠️ الشرح القديم كان يحسبها بالإنجليزي (مئة وحدة = سبعين كلمة) وغلط
+              بالعربي: الموديل بياكل ٣ أو ٤ وحدات بالحرف الواحد، فـ١٠٠ وحدة
+              ≈ ٥ كلمات عربية. على هالشرح انحطّ الحد ١٠٠ بمساحة حقيقية،
+              فصار كل رد ينقطع بنص الكلمة، يرفضه الحارس، وتعاد المحاولة
+              ٣ مرات — بطء وسكوت بلا سبب ظاهر. */}
+          <Field label="أقصى طول للرد" hint="بالتوكنز — بالعربي كل ١٠٠ ≈ ٥ كلمات فقط">
             <Input
               type="number"
               min="50"
@@ -483,6 +505,12 @@ export default function AISettingsPage() {
               dir="ltr"
               className="num"
             />
+            {form.maxTokens < SAFE_ARABIC_MAX_TOKENS ? (
+              <div className="mt-2 space-y-1">
+                <RiskNote title="الحد قصير عالعربي — الرد بينقطع بنص الكلمة، والنظام بيرفضه ويعيد المحاولة: بطء بالرد أو ما بيوصل رد أبدًا." />
+                <FixNote>خليه ٨٠٠ أو أكتر. رد مبيعات عربي عادي بياخد ٢٠٠ وحدة.</FixNote>
+              </div>
+            ) : null}
           </Field>
         </div>
         {/* «حد التنفيذ» و«حد الرد» (confidenceExecute/Respond) انشالوا من الشاشة:

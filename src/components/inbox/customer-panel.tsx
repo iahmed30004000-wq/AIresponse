@@ -1,26 +1,62 @@
 "use client";
 
+import { useState } from "react";
 import Link from "next/link";
-import { Facebook, MapPin, Package, Phone, Sparkles } from "lucide-react";
+import { Facebook, MapPin, Package, Phone, RefreshCw, Trash2 } from "lucide-react";
 import { formatNumber, label, t, timeAgo } from "@/lib/i18n";
 import { Avatar } from "../ui/avatar";
 import { Badge, StatusBadge } from "../ui/badge";
+import { Button } from "../ui/button";
+import { ConfirmDialog } from "../ui/confirm";
 import { GlassCard } from "../ui/card";
 import { EmptyState } from "../ui/empty-state";
 import { CHANNEL_LABELS, type CustomerDetail, type DraftInfo } from "./types";
-import { MarketingCard } from "./marketing-card";
 
 export function CustomerPanel({
   customer,
-  orderDraft,
+  orderDrafts,
   pageName,
+  onRefreshProfile,
+  onResetMemory,
 }: {
   customer: CustomerDetail | null;
-  orderDraft: DraftInfo | null;
+  orderDrafts: DraftInfo[];
   pageName?: string | null;
+  onRefreshProfile?: () => Promise<{ ok: boolean; message: string }>;
+  onResetMemory?: () => Promise<void>;
 }) {
+  const [refreshingProfile, setRefreshingProfile] = useState(false);
+  const [profileMessage, setProfileMessage] = useState<string | null>(null);
+  const [resetOpen, setResetOpen] = useState(false);
+  const [resetting, setResetting] = useState(false);
+
   if (!customer) {
     return <EmptyState title={t.customer.noSelection} className="h-full" />;
+  }
+
+  async function resetMemory() {
+    if (!onResetMemory) return;
+    setResetting(true);
+    try {
+      await onResetMemory();
+    } finally {
+      setResetting(false);
+      setResetOpen(false);
+    }
+  }
+
+  async function refreshProfile() {
+    if (!onRefreshProfile) return;
+    setRefreshingProfile(true);
+    setProfileMessage(null);
+    try {
+      const r = await onRefreshProfile();
+      setProfileMessage(r.message);
+    } catch {
+      setProfileMessage("تعذّر تحديث الاسم — جرّب مرة ثانية.");
+    } finally {
+      setRefreshingProfile(false);
+    }
   }
 
   return (
@@ -54,6 +90,22 @@ export function CustomerPanel({
               </Badge>
             )}
           </div>
+          {onRefreshProfile && (
+            <div className="mt-2">
+              <button
+                type="button"
+                onClick={() => void refreshProfile()}
+                disabled={refreshingProfile}
+                className="inline-flex items-center gap-1 rounded-lg px-2 py-1 text-[11px] font-semibold text-brand-600 transition hover:bg-brand-500/10 disabled:opacity-60 dark:text-brand-300"
+              >
+                <RefreshCw size={11} className={refreshingProfile ? "animate-spin" : ""} />
+                {refreshingProfile ? "جارٍ التحديث…" : "تحديث الاسم والصورة"}
+              </button>
+              {profileMessage && (
+                <p className="mt-1 max-w-[220px] text-[10px] leading-relaxed text-ink-subtle">{profileMessage}</p>
+              )}
+            </div>
+          )}
         </div>
       </div>
 
@@ -91,9 +143,6 @@ export function CustomerPanel({
         )}
       </GlassCard>
 
-      {/* P12 — موافقة الرسائل التسويقية ومصدر الزبون */}
-      <MarketingCard customerId={customer.id} />
-
       {/* Orders */}
       <GlassCard level="glass-subtle" className="p-3.5">
         <p className="mb-2 flex items-center gap-1.5 text-xs font-bold text-ink">
@@ -122,18 +171,23 @@ export function CustomerPanel({
         )}
       </GlassCard>
 
-      {/* Order draft */}
-      {orderDraft && <OrderDraftCard draft={orderDraft} />}
+      {/* طلبات مفتوحة — كل منتج مسودة مستقلة */}
+      {orderDrafts.length > 0 && (
+        <div className="space-y-2">
+          {orderDrafts.map((draft) => (
+            <OrderDraftCard key={draft.id} draft={draft} />
+          ))}
+        </div>
+      )}
 
-      {/* AI summary */}
-      <div className="rounded-2xl border border-sky-500/20 bg-gradient-to-b from-sky-500/10 to-sky-500/5 p-3.5 dark:border-sky-400/20">
-        <p className="mb-1.5 flex items-center gap-1.5 text-xs font-bold text-sky-700 dark:text-sky-300">
-          <Sparkles aria-hidden size={13} /> {t.inbox.aiSummary}
-        </p>
-        <p className="text-[11px] leading-relaxed text-sky-900/80 dark:text-sky-200/80">
-          {customer.aiSummary ?? t.inbox.aiSummaryEmpty}
-        </p>
-      </div>
+      {/* حذف ذاكرة المحادثة — المدير فما فوق */}
+      {onResetMemory && (
+        <div className="px-1">
+          <Button size="sm" variant="ghost" className="w-full justify-center text-ink-subtle" onClick={() => setResetOpen(true)}>
+            <Trash2 size={12} /> حذف ذاكرة المحادثة
+          </Button>
+        </div>
+      )}
 
       {/* Timeline */}
       {customer.conversations.length > 1 && (
@@ -150,13 +204,44 @@ export function CustomerPanel({
           </ol>
         </GlassCard>
       )}
+
+      <ConfirmDialog
+        open={resetOpen}
+        onClose={() => setResetOpen(false)}
+        onConfirm={() => void resetMemory()}
+        title="حذف ذاكرة المحادثة؟"
+        body="بينمسح اللي تعلّمه الذكاء من هالمحادثة: الذاكرة المستخرجة وملخّص المحادثة. الرسائل والطلبات وملاحظات الفريق بتضل. ما بيرجع."
+        confirmLabel="حذف الذاكرة"
+        busy={resetting}
+        danger
+      />
     </div>
   );
 }
 
+function draftMissingLabel(key: string): string {
+  switch (key) {
+    case "product": return t.customer.product;
+    case "quantity": return t.customer.quantity;
+    case "phone": return t.customer.phone;
+    case "address": return t.customer.address;
+    case "name": return t.customer.name;
+    default: return key;
+  }
+}
+
 function OrderDraftCard({ draft }: { draft: DraftInfo }) {
   const complete = draft.missingFields.length === 0;
-  const pct = complete ? 100 : Math.round(((4 - draft.missingFields.length) / 4) * 100);
+  // P22 — سلة: اعرض كل المنتجات (مع توافق خلفي للمسودات المفردة).
+  const items =
+    draft.items && draft.items.length > 0
+      ? draft.items
+      : draft.productName
+        ? [{ productName: draft.productName, quantity: draft.quantity }]
+        : [];
+  // P19 — العدد الكلي يتبع إعداد الصفحة (قد يزيد الاسم)؛ لا نسبة سالبة.
+  const total = Math.max(draft.requiredFields?.length ?? 4, draft.missingFields.length);
+  const pct = complete ? 100 : Math.max(0, Math.min(100, Math.round(((total - draft.missingFields.length) / total) * 100)));
   return (
     <div className={
       complete
@@ -177,8 +262,12 @@ function OrderDraftCard({ draft }: { draft: DraftInfo }) {
         />
       </div>
       <div className="space-y-1 text-[11px] text-ink-muted">
-        {draft.productName && <Row text={`${t.customer.product}: ${draft.productName}`} />}
-        {draft.quantity && <Row text={`${t.customer.quantity}: ${formatNumber(draft.quantity)}`} />}
+        {items.map((item, idx) => (
+          <Row
+            key={`${item.productName ?? "item"}-${idx}`}
+            text={`${t.customer.product}: ${item.productName || "—"}${item.quantity ? ` × ${formatNumber(item.quantity)}` : ""}`}
+          />
+        ))}
         <Row icon={<Phone size={11} />} text={draft.phone ? `${t.customer.phone}: ✓` : `${t.customer.phone}: —`} ok={Boolean(draft.phone)} />
         <Row
           icon={<MapPin size={11} />}
@@ -188,7 +277,7 @@ function OrderDraftCard({ draft }: { draft: DraftInfo }) {
       </div>
       {draft.missingFields.length > 0 ? (
         <p className="mt-1.5 text-[10px] leading-relaxed text-amber-700 dark:text-amber-400">
-          {t.inbox.draftMissing}: {draft.missingFields.join("، ")}
+          {t.inbox.draftMissing}: {draft.missingFields.map(draftMissingLabel).join("، ")}
         </p>
       ) : (
         <p className="mt-1 text-[11px] font-bold text-emerald-700 dark:text-emerald-400">{t.inbox.draftReady}</p>

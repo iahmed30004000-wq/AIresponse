@@ -1,4 +1,6 @@
 ﻿import type { Prisma, StockStatus } from "@prisma/client";
+import { customerFacingPriceTiers } from "./price-tiers";
+import { COMPARE_AT_PRICE_MESSAGE } from "./schemas";
 import { AppError, ConflictError, NotFoundError } from "@/core/errors";
 import { makeEvent, eventBus } from "@/core/events/bus";
 import { recordAudit } from "@/modules/audit/service";
@@ -99,11 +101,19 @@ export async function createProduct(db: Db, ctx: ActorContext, input: ProductInp
   // تدقيق الأسعار قبل الإنشاء — رفض صريح ما يخلّي منتج مأكول بلا أسعار سليمة.
   const tiers = normalizeTiers(input.priceTiers, db);
 
-  const product = await db.product.create({
-    data: { ...input, priceTiers: undefined, workspaceId: ctx.workspaceId } as Prisma.ProductUncheckedCreateInput,
+  const write = async (tx: Db) => {
+    const created = await tx.product.create({
+      data: { ...input, priceTiers: undefined, workspaceId: ctx.workspaceId } as Prisma.ProductUncheckedCreateInput,
+    });
+    if (tiers.length > 0) await tx.productPrice.createMany({ data: tiers.map((t) => ({ productId: created.id, label: t.label, price: t.price })) });
+    return created;
+  };
+  const anyDb = db as unknown as { $transaction?: <R>(fn: (tx: Db) => Promise<R>) => Promise<R> };
+  const product = await (typeof anyDb.$transaction === "function" ? anyDb.$transaction(write) : write(db)).catch((err: unknown) => {
+    // Two requests can pass the SKU check above at the same moment.
+    if ((err as { code?: string })?.code === "P2002") throw new ConflictError("A product with this SKU already exists");
+    throw err;
   });
-
-  if (tiers.length > 0) await db.productPrice.createMany({ data: tiers.map((t) => ({ productId: product.id, label: t.label, price: t.price })) });
 
   await recordAudit(db, {
     workspaceId: ctx.workspaceId,
@@ -195,6 +205,15 @@ export async function updateProduct(
       select: { id: true },
     });
     if (clash) throw new ConflictError("A product with this SKU already exists");
+  }
+
+  // تحديث جزئي: المخطط ما بيعرف القيمة المخزّنة، فالمقارنة هون مع القيمة الفعلية.
+  if (data.price !== undefined || data.compareAtPrice !== undefined) {
+    const compareAt = data.compareAtPrice !== undefined ? data.compareAtPrice : existing.compareAtPrice;
+    const price = data.price ?? existing.price;
+    if (compareAt !== null && compareAt !== undefined && Number(compareAt) <= Number(price)) {
+      throw new AppError(COMPARE_AT_PRICE_MESSAGE, 422, "INVALID_COMPARE_AT_PRICE");
+    }
   }
 
   // تدقيق الأسعار قبل التحديث — رفض صريح ما يخلّي تحديث جزئي متضارب.
@@ -341,4 +360,22 @@ export async function reorderProductMedia(
     });
     if (link) await db.productMedia.update({ where: { id: link.id }, data: { sortOrder: i } });
   }
+}
+
+/** حقول مالية حساسة — تظهر فقط لمن يملك `products.wholesale` (إنفاذ خادمي). */
+export const WHOLESALE_ONLY_FIELDS = ["wholesalePrice", "discountCap"] as const;
+
+/**
+ * يشيل سعر الجملة وسقف الخصم من أي منتج يُرجَع بالـ API لمن لا يملك
+ * `products.wholesale` (مثلاً SALES_AGENT · SUPPORT_AGENT · VIEWER).
+ */
+export function redactProductForActor<T extends object>(
+  product: T,
+  actor: { can: (permission: "products.wholesale") => boolean }
+): T {
+  if (actor.can("products.wholesale")) return product;
+  const copy: Record<string, unknown> = { ...(product as Record<string, unknown>) };
+  for (const f of WHOLESALE_ONLY_FIELDS) delete copy[f];
+  if (Array.isArray(copy.priceTiers)) copy.priceTiers = customerFacingPriceTiers(copy.priceTiers as { label: string }[]);
+  return copy as T;
 }

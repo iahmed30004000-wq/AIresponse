@@ -68,6 +68,17 @@ export async function runIntegrationScheduler(db: Db, now = new Date()): Promise
     await purgeOldCustomerMedia(db, now).catch((err) => log.error({ err }, "wa_media_purge_failed"));
     const { purgeOldWebhookPayloads } = await import("@/modules/channels/webhook-retention");
     await purgeOldWebhookPayloads(db, now).catch((err) => log.error({ err }, "webhook_payload_purge_failed"));
+    // ربط الـ OMS: منتجات وأسعار من الـ OMS كل ساعة · طلبات علقت بانقطاعه بتنعاد.
+    const oms = await import("@/modules/oms/auto-handoff");
+    await oms.enqueueHourlyProductSyncs(db, now).catch((err) => log.error({ err }, "oms_sync_enqueue_failed"));
+    await oms.sweepStuckOmsHandoffs(db, now).catch((err) => log.error({ err }, "oms_handoff_sweep_failed"));
+    // طلب مؤكد ما إله مهمة ترحيل أصلًا (الربط انعمل بعده): بياخد مهمته هون —
+    // للـ OMS ولمجموعة تيليغرام.
+    const delivery = await import("@/modules/orders/delivery-sweep");
+    await delivery.sweepOrdersMissingOms(db, now).catch((err) => log.error({ err }, "oms_missing_sweep_failed"));
+    await delivery
+      .sweepOrdersMissingTelegram(db, now)
+      .catch((err) => log.error({ err }, "telegram_missing_sweep_failed"));
   }
 
   const conns = (await (db as unknown as { integrationConnection?: { findMany: (a: unknown) => Promise<unknown> } }).integrationConnection?.findMany({

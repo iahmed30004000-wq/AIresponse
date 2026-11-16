@@ -31,6 +31,16 @@ export const JOB_TYPES = [
   "download_whatsapp_media",
   // مختبر التجميع: استخراج معلومات العميل من رسالة واردة (وضع COLLECTION_ONLY).
   "extract_customer_intel",
+  // P17 — اسم/صورة المرسل من Graph: مهمة تجميلية خارج مسار الرد تمامًا،
+  // كي لا يدفع الزبون الجديد ثمن نداء Graph (حتى 4 ثوان) قبل أول رد.
+  "resolve_sender_profile",
+  // P19 — إشعار تيليجرام بمسودة طلب صارت READY (مجموعة/توبيك محدّد).
+  "notify_order_ready",
+  // إعادة محاولة إشعار طلب رسمي لتلجرام بعد فشل الإرسال الأول.
+  "notify_order_telegram",
+  // ربط الـ OMS (باب /api/v1): إرسال طلب مؤكد · مزامنة المنتجات الساعية.
+  "handoff_order_to_oms",
+  "sync_oms_products",
 ] as const;
 
 export type JobType = (typeof JOB_TYPES)[number];
@@ -112,6 +122,8 @@ export async function enqueueJob(
 export interface JobResult {
   success: boolean;
   error?: string;
+  /** Not ready yet: put the job back in the queue after this delay (no attempt spent). */
+  deferMs?: number;
 }
 
 export type JobHandler = (
@@ -249,17 +261,38 @@ export async function recoverOrphanedInboundMessages(
     });
     const convById = new Map(conversations.map((c: { id: string }) => [c.id, c]));
 
+    // PERF — workspace-level AI switch (same rule the pipeline enforces in
+    // gating: `AISettings.aiEnabled === false` or `autoRespond === false`).
+    // Without this check a workspace with AI switched off kept re-enqueueing
+    // every stuck message on EVERY sweep: job → AI_DISABLED (visible but
+    // intentionally non-terminal) → sweep re-enqueues → repeat forever. The
+    // gate only stops pointless re-queueing; the moment the owner turns AI
+    // back on the very next sweep recovers the message normally (no backoff,
+    // no wait — master-reliability requires immediate recovery).
+    const workspaceIds = [...new Set(candidates.map((m: { workspaceId: string }) => m.workspaceId))];
+    const aiSettingsRows = await (db as any).aISettings.findMany({
+      where: { workspaceId: { in: workspaceIds } },
+      select: { workspaceId: true, aiEnabled: true, autoRespond: true },
+    });
+    const aiDisabledWorkspaces = new Set<string>(
+      aiSettingsRows
+        .filter((s: { workspaceId: string; aiEnabled?: boolean | null; autoRespond?: boolean | null }) =>
+          !s.aiEnabled || s.autoRespond === false
+        )
+        .map((s: { workspaceId: string }) => s.workspaceId)
+    );
+
     const messageIds = candidates.map((m: { id: string }) => m.id);
     const logs = await (db as any).aIUsageLog.findMany({
       where: { messageId: { in: messageIds }, purpose: "RESPONSE" },
       select: { messageId: true, status: true, createdAt: true },
     });
-    // SUCCESS/HANDOFF = decided. AI_FAILED = backoff accounting.
+    // SUCCESS/HANDOFF/SKIPPED (superseded) = decided. AI_FAILED = backoff accounting.
     // AI_DISABLED = visible but non-terminal (reprocessable on re-enable).
     const stateByMessage = new Map<string, { decided: boolean; failCount: number; lastFailureAt: number }>();
     for (const l of logs) {
       const entry = stateByMessage.get(l.messageId) ?? { decided: false, failCount: 0, lastFailureAt: 0 };
-      if (l.status === "SUCCESS" || l.status === "HANDOFF") {
+      if (l.status === "SUCCESS" || l.status === "HANDOFF" || l.status === "SKIPPED") {
         entry.decided = true;
       } else if (l.status === "AI_FAILED") {
         entry.failCount += 1;
@@ -303,6 +336,10 @@ export async function recoverOrphanedInboundMessages(
         skipped += 1;
         continue;
       }
+      if (aiDisabledWorkspaces.has(m.workspaceId)) {
+        skipped += 1;
+        continue;
+      }
       const state = stateByMessage.get(m.id);
       if (state?.decided || liveMessageIds.has(m.id)) {
         skipped += 1;
@@ -333,27 +370,135 @@ export async function recoverOrphanedInboundMessages(
   return { recovered, skipped };
 }
 
-export async function processPendingJobs(
+/**
+ * PERF — should the heavy maintenance sweeps run this cycle?
+ * Pure helper (tested): sweeps are idempotent backstops, not per-reply work, so
+ * a busy worker can run them once every N cycles. `every <= 1` (default) keeps
+ * the exact old behaviour — maintenance runs every cycle.
+ */
+export function shouldRunMaintenance(cycle: number, every: number): boolean {
+  const n = Math.trunc(every);
+  if (!Number.isFinite(n) || n <= 1) return true;
+  return cycle % n === 0;
+}
+
+/**
+ * How many worker processes one container runs (WORKER_PROCESSES). Lets a single
+ * container scale on platforms that cannot run Compose replicas, such as Coolify.
+ */
+export function resolveWorkerProcesses(raw: string | undefined): number {
+  const n = Math.trunc(Number(raw ?? 1));
+  if (!Number.isFinite(n) || n < 1) return 1;
+  return Math.min(16, n);
+}
+
+/**
+ * PERF — bounded concurrency for AI jobs.
+ *
+ * AI replies spend nearly all their time waiting on the provider (network),
+ * not on the CPU. One slow conversation used to hold up every other
+ * conversation in the same batch because the batch ran strictly sequentially.
+ * AI jobs are therefore grouped by conversation (each group stays strictly
+ * ordered — an older message must never be answered after a newer one) and a
+ * bounded number of groups run at the same time. Non-AI jobs keep the original
+ * sequential order: they are cheap DB/bookkeeping work and reordering them
+ * would change the meaning of the queue.
+ *
+ * Default 8, clamped to 1..16. Setting it to 1 restores the old serial
+ * behaviour exactly (useful for debugging or a constrained host).
+ * Actual capacity = this × number of Worker containers.
+ */
+export const AI_JOB_CONCURRENCY = Math.min(
+  16,
+  Math.max(1, Math.trunc(Number(process.env.AI_JOB_CONCURRENCY ?? 8)) || 8)
+);
+
+/** Jobs on the path to the customer reply: picked up before everything else. */
+const REPLY_PATH_JOB_TYPES = ["process_webhook_event", "process_channel_inbound", "process_ai_message"] as const;
+
+const MIN_DEFER_MS = 500;
+const DEFER_BACKOFF_AFTER_MS = 30_000;
+const DEFER_BACKOFF_MS = 5_000;
+
+/**
+ * How long a deferred job waits. Never below the floor, so no handler can spin
+ * the queue; and a job that has been waiting a while (its older sibling sits in
+ * a long retry back-off) stops re-checking every second. Pure function (tested).
+ */
+export function deferDelayMs(requestedMs: number, jobAgeMs: number): number {
+  const delay = Math.max(MIN_DEFER_MS, requestedMs);
+  return jobAgeMs > DEFER_BACKOFF_AFTER_MS ? Math.max(delay, DEFER_BACKOFF_MS) : delay;
+}
+
+/**
+ * Jobs that wait on the AI provider. Run sequentially, a batch of slow
+ * intel/summary jobs held up the whole cycle — and every reply behind it. They
+ * run concurrently per conversation, sharing the AI semaphore.
+ */
+const CONVERSATION_CONCURRENT_JOB_TYPES = new Set([
+  "process_ai_message",
+  "extract_customer_intel",
+  "generate_summary",
+]);
+
+function createSemaphore(max: number) {
+  let active = 0;
+  const waiters: Array<() => void> = [];
+  return {
+    async acquire(): Promise<void> {
+      if (active < max) {
+        active += 1;
+        return;
+      }
+      // The slot is handed over directly by release() — active stays put.
+      await new Promise<void>((resolve) => waiters.push(resolve));
+    },
+    release(): void {
+      const next = waiters.shift();
+      if (next) next();
+      else active -= 1;
+    },
+  };
+}
+
+/**
+ * Runs ONE bounded batch of pending jobs (oldest first). `createdAfter`
+ * restricts the batch to jobs created at/after a moment — used by the
+ * same-cycle follow-through below so a freshly enqueued AI job is picked up
+ * without waiting for the next poll.
+ */
+async function processJobBatch(
   db: Db,
   handlers: Record<string, JobHandler>,
-  opts: { limit?: number; workerId?: string } = {}
+  limit: number,
+  workerId: string | undefined,
+  createdAfter?: Date
 ): Promise<{ processed: number; failed: number }> {
-  await recoverStaleJobs(db);
-  // Recover stuck outbound messages across all workspaces before processing new jobs
-  await recoverStuckOutboundMessages(db, { maxAgeMinutes: 10, limit: 20 });
-  // Durable backstop: re-queue inbound messages that never reached a terminal
-  // AI decision (enqueue failure, exhausted job attempts, worker downtime).
-  await recoverOrphanedInboundMessages(db, { limit: 20 });
-  const jobs = await db.backgroundJob.findMany({
-    where: { status: "PENDING", runAfter: { lte: new Date() } },
+  // PRIORITY — the jobs a customer is waiting on (REPLY_PATH_JOB_TYPES) are
+  // fetched FIRST and separately, so they never queue behind a backlog of older
+  // bookkeeping jobs (automation/intel/summary fan-out). Others keep their own
+  // batch, still oldest-first, so they are never starved.
+  const baseWhere = {
+    status: "PENDING" as const,
+    runAfter: { lte: new Date() },
+    ...(createdAfter ? { createdAt: { gte: createdAfter } } : {}),
+  };
+  const replyJobs = await db.backgroundJob.findMany({
+    where: { ...baseWhere, type: { in: [...REPLY_PATH_JOB_TYPES] } },
     orderBy: { createdAt: "asc" },
-    take: opts.limit ?? 10,
+    take: limit,
   });
+  const otherJobs = await db.backgroundJob.findMany({
+    where: { ...baseWhere, type: { notIn: [...REPLY_PATH_JOB_TYPES] } },
+    orderBy: { createdAt: "asc" },
+    take: limit,
+  });
+  const jobs = [...replyJobs, ...otherJobs];
 
   let processed = 0;
   let failed = 0;
 
-  for (const job of jobs) {
+  const runJob = async (job: (typeof jobs)[number]): Promise<void> => {
     // Atomic claim: only PENDING jobs can transition. Concurrent workers
     // racing on the same row get count===0 and skip it.
     const claimed = await db.backgroundJob.updateMany({
@@ -363,10 +508,10 @@ export async function processPendingJobs(
         startedAt: new Date(),
         attempts: { increment: 1 },
         lockedAt: new Date(),
-        lockedBy: opts.workerId ?? "worker",
+        lockedBy: workerId ?? "worker",
       },
     });
-    if (claimed.count === 0) continue;
+    if (claimed.count === 0) return;
 
     const handler = handlers[job.type];
     let result: JobResult;
@@ -380,10 +525,10 @@ export async function processPendingJobs(
       } else {
         // The claimed row's workspaceId is the authoritative tenant context.
         // Passing it explicitly prevents the "same-cycle recovery" trap: jobs
-        // created by the recovery sweeps DURING this cycle are not in the
-        // pre-claimed pending snapshot (runJobs' jobWorkspaces map), which
-        // used to resolve to "" and make workspace-scoped handlers silently
-        // no-op (SKIPPED → DONE → sweeper re-enqueues → hot loop).
+        // created by the recovery sweeps DURING this cycle are not part of the
+        // pre-claimed pending snapshot, so an empty workspace used to make
+        // workspace-scoped handlers silently no-op (SKIPPED → DONE → sweeper
+        // re-enqueues → hot loop).
         result = await Promise.race([
           handler(job.payload as Record<string, unknown>, job.id, job.workspaceId),
           new Promise<never>((_, reject) => {
@@ -397,6 +542,21 @@ export async function processPendingJobs(
       }
     } catch (err) {
       result = { success: false, error: err instanceof Error ? err.message : String(err) };
+    }
+
+    if (result.success && result.deferMs) {
+      await db.backgroundJob.update({
+        where: { id: job.id },
+        data: {
+          status: "PENDING",
+          attempts: job.attempts,
+          runAfter: new Date(Date.now() + deferDelayMs(result.deferMs, Date.now() - new Date(job.createdAt).getTime())),
+          startedAt: null,
+          lockedAt: null,
+          lockedBy: null,
+        },
+      });
+      return;
     }
 
     if (result.success) {
@@ -426,8 +586,137 @@ export async function processPendingJobs(
         },
       });
       log.warn({ jobId: job.id, type: job.type, error: result.error, exhausted }, "job_failed");
+      // خلصت كل المحاولات ومهمة رد: رسالة الزبون كانت بتضل بلا أي رد.
+      // منبعت نص ثابت آمن بدل السكوت (بيتخطّى نفسه إذا الموظف مستلم أو
+      // الزبون أصلًا أخد رد أحدث).
+      if (exhausted && job.type === "process_ai_message") {
+        const payload = (job.payload ?? {}) as { conversationId?: string; messageId?: string };
+        if (payload.conversationId && payload.messageId) {
+          const { sendLastResortReply } = await import("@/modules/ai/last-resort");
+          await sendLastResortReply(db, {
+            workspaceId: job.workspaceId,
+            conversationId: payload.conversationId,
+            messageId: payload.messageId,
+            reason: result.error ?? "unknown error",
+          });
+        }
+      }
     }
+  };
+
+  // One serial chain per conversation for AI jobs; everything else runs in the
+  // original sequential order.
+  const conversationChains = new Map<string, Promise<void>>();
+  const running: Promise<void>[] = [];
+  const semaphore = createSemaphore(AI_JOB_CONCURRENCY);
+
+  for (const job of jobs) {
+    // P17 — cosmetic profile enrichment never blocks replies: run it
+    // concurrently with AI jobs and do NOT wait for it before the tick
+    // returns. A slow/failing Graph call must not delay the next customer's
+    // message or the same-cycle reply batch. The row is claimed and updated
+    // normally, so a crash still leaves it recoverable by the stale-job sweep.
+    if (job.type === "resolve_sender_profile") {
+      void (async () => {
+        await semaphore.acquire();
+        try {
+          await runJob(job);
+        } finally {
+          semaphore.release();
+        }
+      })().catch((err) => {
+        log.error(
+          { jobId: job.id, type: job.type, error: err instanceof Error ? err.message : String(err) },
+          "profile_job_detached_failed"
+        );
+      });
+      continue;
+    }
+
+    const payload = job.payload as { conversationId?: unknown } | null;
+    const conversationId =
+      CONVERSATION_CONCURRENT_JOB_TYPES.has(job.type) && typeof payload?.conversationId === "string"
+        ? payload.conversationId
+        : null;
+
+    if (!conversationId) {
+      await runJob(job);
+      continue;
+    }
+
+    const previous = conversationChains.get(conversationId);
+    const task = (async () => {
+      // Preserve per-conversation order: never start before the previous
+      // message of the SAME conversation finished (success or failure).
+      if (previous) await previous.catch(() => undefined);
+      await semaphore.acquire();
+      try {
+        await runJob(job);
+      } finally {
+        semaphore.release();
+      }
+    })();
+    conversationChains.set(conversationId, task);
+    running.push(task);
   }
 
+  // allSettled: a failing DB write in one job must not leave sibling promises
+  // rejected-without-handler. The first real error is rethrown afterwards.
+  const settled = await Promise.allSettled(running);
+  const rejected = settled.find((s) => s.status === "rejected");
+  if (rejected && rejected.status === "rejected") throw rejected.reason;
+
   return { processed, failed };
+}
+
+/**
+ * Processes pending jobs. Before the first batch it runs the maintenance sweeps
+ * (stale-job recovery, stuck outbound, orphaned inbound) — skippable via
+ * `maintenance: false` so a busy worker can run them once every N cycles.
+ *
+ * PERF — same-cycle follow-through (`sameCycle: true`): a webhook/inbound job
+ * often enqueues a `process_ai_message` job while being processed. Without it
+ * that AI job waits a full poll interval before the next batch. When enabled,
+ * one extra bounded batch runs immediately for jobs created during this cycle,
+ * so a reply starts within the same worker tick instead of the next.
+ */
+export async function processPendingJobs(
+  db: Db,
+  handlers: Record<string, JobHandler>,
+  opts: { limit?: number; workerId?: string; maintenance?: boolean; sameCycle?: boolean } = {}
+): Promise<{ processed: number; failed: number }> {
+  const limit = opts.limit ?? 10;
+  const cycleStartedAt = new Date();
+  let orphanSweep: Promise<number> = Promise.resolve(0);
+  if (opts.maintenance !== false) {
+    await recoverStaleJobs(db);
+    // Recover stuck outbound messages across all workspaces before processing new jobs
+    await recoverStuckOutboundMessages(db, { maxAgeMinutes: 10, limit: 20 });
+    // Durable backstop: re-queue inbound messages that never reached a terminal
+    // AI decision (enqueue failure, exhausted job attempts, worker downtime).
+    // It pages through many rows, so it runs beside the batch instead of ahead
+    // of it. Awaited below: one sweep per cycle, never one left running.
+    orphanSweep = recoverOrphanedInboundMessages(db, { limit: 20 }).then(
+      (r) => r.recovered,
+      (err) => {
+        log.error({ error: err instanceof Error ? err.message : String(err) }, "orphan_sweep_failed");
+        return 0;
+      }
+    );
+  }
+
+  const result = await processJobBatch(db, handlers, limit, opts.workerId);
+  const orphansRecovered = await orphanSweep;
+
+  if (opts.sameCycle || orphansRecovered > 0) {
+    // Only jobs created AFTER the first batch's snapshot — no re-running work
+    // the batch already claimed (that would be a no-op but wasted queries).
+    // A recovered orphan is answered this cycle, as it was before the sweep
+    // moved beside the batch.
+    const extra = await processJobBatch(db, handlers, limit, opts.workerId, cycleStartedAt);
+    result.processed += extra.processed;
+    result.failed += extra.failed;
+  }
+
+  return result;
 }

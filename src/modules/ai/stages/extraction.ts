@@ -7,6 +7,7 @@
  * deterministic response plan → human-review and handoff terminals.
  * Returns a terminal result or the ready state for response generation.
  */
+import { pickBestProductMatch, productSearchWords } from "@/modules/ai/product-match";
 import { childLogger } from "@/core/logger";
 import { resolveModel, withRetry, logUsage } from "../router";
 import {
@@ -20,13 +21,16 @@ import { extractionResultSchema, validateStructured, type ExtractionResult, type
 import { heuristicIntent, looksLikeInjection } from "../intent";
 import { saveMemories, loadMemory } from "../memory";
 import { buildAIContext } from "../context-builder";
+import { buildCatalogBoundary, loadRecallGuard, scrubRecalledHistory } from "../catalog-boundary";
 import { wantsMedia } from "@/modules/media/request";
+import { searchKnowledgeChunks } from "@/modules/knowledge/retriever";
 import type { VectorStore } from "@/modules/knowledge/vector-store";
 import { PgVectorStore } from "@/modules/knowledge/vector-store";
 import { prisma } from "@/core/db/prisma";
 import { sendProtectedStructured, extractPhoneDeterministic } from "../privacy-gate";
 import { recordAudit } from "@/modules/audit/service";
-import { handleOrderIntent } from "@/modules/orders/intelligence";
+import { matchProductByAnyName } from "@/modules/products/name-match";
+import { handleOrderIntent, hasOrderData } from "@/modules/orders/intelligence";
 import { isBuyingContext } from "@/modules/sales/plan-builder";
 import type { Db } from "@/modules/customers/service";
 import type {
@@ -40,11 +44,38 @@ import type {
 
 const log = childLogger("orchestrator");
 
+const KNOWLEDGE_LIMIT = 4;
+
+/**
+ * Extraction only classifies, and the reply can go on without it (heuristic
+ * fallback below), so it must never spend the job's 120s limit. The response
+ * call keeps AI_REQUEST_TIMEOUT_MS.
+ */
+function extractionTimeoutMs(): number {
+  return Math.max(1000, parseInt(process.env.AI_EXTRACTION_TIMEOUT_MS ?? "15000", 10) || 15000);
+}
+
+function extractionAttempts(): number {
+  return Math.min(3, Math.max(1, parseInt(process.env.AI_EXTRACTION_ATTEMPTS ?? "1", 10) || 1));
+}
+
+/** Started now, awaited later: a failure must surface there, not as unhandled. */
+function startedEarly<T>(work: Promise<T>): Promise<T> {
+  work.catch(() => undefined);
+  return work;
+}
+
 // Pure visual asks are safe to classify without the model — they carry no
 // order fields. Any order/price/contact signal keeps the normal path so a
 // message like «ورجيني الصورة وكم سعرها» still gets full extraction.
 const MEDIA_FAST_PATH_BLOCKERS =
   /طلب|طلبي|طلبية|أطلب|اطلب|سعر|بكم|كم\s|توصيل|شحن|عنوان|هاتف|رقم|دفع|تحويل|موظف|شكوى|إلغاء|الغاء|تعديل|إرجاع|ارجاع|اسمي/i;
+
+// Pure small-talk only. A whitelist (not "anything unknown") keeps dialect
+// buying verbs («أبغى»، «بدي»، «ناوي») on the normal extraction path — a short
+// message can still be an order.
+const SMALL_TALK =
+  /^(?:شكرا|شكرًا|مشكور|مشكورة|يسلمو|تسلم|تسلمي|تمام|أوكي|اوكي|أوك|ok|okay|حلو|ممتاز|رائع|كيفك|كيف حالك|شو أخبارك|شو الاخبار|صباح الخير|مساء الخير|مع السلامة|باي|thanks|thank you)[\s!.,،؟?❤️🌹🙏]*$/iu;
 
 
 export async function runExtraction(
@@ -68,15 +99,69 @@ export async function runExtraction(
     provider,
   } = gate;
 
+  // Read-only and independent of what the model extracts: running while the
+  // catalog and the extraction call do. Awaited where they are used.
+  const memoriesPending = startedEarly(loadMemory(db, params.workspaceId, customer.id));
+
+  // Catalog resolution runs FIRST: the page's catalog scopes the history the
+  // model sees, the REPLY candidates and — through the same allowlist — ORDER
+  // INTAKE below. One resolution, one trusted source; no second round-trip.
+  // resolveCatalogForChannel short-circuits workspaces with no catalogs
+  // internally:
+  // no_catalogs → undefined (legacy: every product may answer/order),
+  // assigned+active → ids, otherwise → [] (nothing may answer/order).
+  const { resolveCatalogForChannel, catalogProductIds } = await import(
+    "@/modules/catalog/service"
+  );
+  const resolved = await resolveCatalogForChannel(db, params.workspaceId, conversation.channelId);
+  log.info(
+    { conversationId: conversation.id, channelId: conversation.channelId, catalog: resolved.status },
+    "ai_catalog_resolved"
+  );
+  const allowedProductIds =
+    resolved.status === "ok"
+      ? await catalogProductIds(db, params.workspaceId, resolved.catalog.id, resolved.catalog)
+      : resolved.status === "no_catalogs"
+        ? undefined
+        : [];
+
+  // Document search needs only the words and the page's catalog, not the
+  // extracted product: it runs during the extraction call below.
+  const vectorStore = deps.vectorStore ?? getVectorStore();
+  // Documents enrich the reply; they never decide whether it goes out. A
+  // failed or slow embedding call used to throw out of the whole pipeline,
+  // and the job waited its 30s back-off with the customer unanswered.
+  const chunksPending = startedEarly(
+    searchKnowledgeChunks(db, vectorStore, {
+      workspaceId: params.workspaceId,
+      query: customerText,
+      limit: KNOWLEDGE_LIMIT,
+      allowedProductIds,
+    }).catch((err) => {
+      log.warn(
+        { conversationId: conversation.id, messageId: message.id, error: err instanceof Error ? err.message : "knowledge_search_failed" },
+        "knowledge_search_failed"
+      );
+      return [];
+    })
+  );
+
+  // P18 — حدود الكتالوج: أسماء المنتجات المسموحة تُحقن بتعليمات الرد، وأسماء
+  // المنتجات خارجها تُشال من الذاكرة/الملخص/السجل كي لا «يتذكّرها» الذكاء.
+  // undefined = ما في كتالوجات أصلًا (سلوك قديم) → بلا حدود ولا فلترة.
+  const recallGuard = await loadRecallGuard(db, params.workspaceId, allowedProductIds);
+  const catalogBoundary = recallGuard ? buildCatalogBoundary(recallGuard.allowedNames) : undefined;
+
   // 5. Intent + entity extraction (structured, repaired, retried, fallback).
   const modelCfg = resolveModel(settings, "EXTRACTION");
   // Newest-last copy; the original array is shared with later stages.
   const historyAsc = [...recentMessages].reverse();
   const extractionUser = wrapUntrustedCustomerContent(
     customerText,
-    historyAsc.map((m) => ({
+    scrubRecalledHistory(recallGuard, historyAsc, message.id).map((m) => ({
       sender: m.senderType,
-      text: m.text ?? "[وسائط]",
+      // `||`: a media-only reply is stored with empty text.
+      text: m.text || "[وسائط]",
     }))
   );
   // Latency: extraction classifies intent/entities only — it does NOT write
@@ -109,8 +194,19 @@ export async function runExtraction(
     !/\d/.test(customerText) &&
     !MEDIA_FAST_PATH_BLOCKERS.test(customerText) &&
     !looksLikeInjection(customerText);
+  // Speed: pure small-talk ("شكراً"، "تمام"، "كيفك") has no entities to
+  // extract. Skipping the extraction call removes one full blocking model
+  // round-trip. The whitelist is deliberate: any other short message keeps the
+  // normal path so orders/prices/addresses (in any dialect) are never guessed.
+  const generalFastPath =
+    heuristicPre.intent === "UNKNOWN" &&
+    customerText.trim().length > 0 &&
+    customerText.trim().length <= 40 &&
+    SMALL_TALK.test(customerText.trim()) &&
+    !/\d/.test(customerText) &&
+    !looksLikeInjection(customerText);
   try {
-    if (fastPathGreeting || mediaFastPath) {
+    if (fastPathGreeting || mediaFastPath || generalFastPath) {
       extraction = {
         intent: mediaFastPath ? "PRODUCT_QUESTION" : heuristicPre.intent,
         confidence: heuristicPre.confidence,
@@ -121,6 +217,11 @@ export async function runExtraction(
       };
       fx.stageMs.extractionSkipped = 1;
     } else {
+      // P14 — توضيح: هذه المرحلة (`extraction` في توقيتات خط الأنابيب) هي
+      // استخراج **نية/كيانات الرسالة** (منتج/كمية/عنوان…) اللازمة لصياغة الرد،
+      // داخل مسار الرد المتزامن. أما `extract_customer_intel` فهي **مهمة خلفية
+      // مستقلة** تستخرج **ملف العميل** (اسم/رقم/مدينة…) بعد الإرسال ولا يتسلسل
+      // الرد وراءها إطلاقًا. الاثنان مختلفان — لا يخلط بينهما.
       const res = await timed("extraction", () =>
         withRetry(
           () =>
@@ -130,9 +231,10 @@ export async function runExtraction(
               model: modelCfg.model,
               temperature: modelCfg.temperature,
               maxTokens: modelCfg.maxTokens,
+              timeoutMs: extractionTimeoutMs(),
               validate: (raw) => validateStructured(extractionResultSchema, raw),
             }, { pii: customerPII, trustedContacts, purpose: "EXTRACTION" }),
-          { attempts: 2 }
+          { attempts: extractionAttempts() }
         )
       );
       extraction = res.value;
@@ -194,33 +296,16 @@ export async function runExtraction(
   // Injection defence: customer content never escalates or changes policy.
   const injection = looksLikeInjection(customerText);
 
-  // Catalog resolution runs FIRST: the page's catalog scopes both the REPLY
-  // candidates and — through the same allowlist — ORDER INTAKE below. One
-  // resolution, one trusted source; no second round-trip later.
-  // resolveCatalogForChannel short-circuits workspaces with no catalogs
-  // internally:
-  // no_catalogs → undefined (legacy: every product may answer/order),
-  // assigned+active → ids, otherwise → [] (nothing may answer/order).
-  const { resolveCatalogForChannel, catalogProductIds } = await import(
-    "@/modules/catalog/service"
-  );
-  const resolved = await resolveCatalogForChannel(db, params.workspaceId, conversation.channelId);
-  log.info(
-    { conversationId: conversation.id, channelId: conversation.channelId, catalog: resolved.status },
-    "ai_catalog_resolved"
-  );
-  const allowedProductIds =
-    resolved.status === "ok"
-      ? await catalogProductIds(db, params.workspaceId, resolved.catalog.id)
-      : resolved.status === "no_catalogs"
-        ? undefined
-        : [];
-
   // Order Intelligence: deterministic draft/rules handling for order intents.
   let orderResult: Awaited<ReturnType<typeof handleOrderIntent>> | null = null;
+  // ⚠️ البوابة كانت على التصنيف بس: رسالة فيها الرقم والعنوان وصنّفها الموديل
+  // «سؤال» ما كانت توصل منطق الطلب أبدًا، فبياناتها تنرمى.
+  // 🔧 `hasOrderData` فحص حتمي بلا قاعدة بيانات ولا نداء ذكاء — بيمرّر الرسالة
+  // اللي فيها بيانات طلب مهما كان تصنيفها.
   if (
     ["ORDER_CREATE", "ORDER_UPDATE", "ORDER_CANCEL", "UNKNOWN"].includes(extraction.intent) ||
-    extraction.requestedAction === "CREATE_ORDER"
+    extraction.requestedAction === "CREATE_ORDER" ||
+    hasOrderData(extraction)
   ) {
     try {
       orderResult = await handleOrderIntent(db, {
@@ -251,7 +336,7 @@ export async function runExtraction(
   ];
   const [memories, productId] = await timed("memoryProduct", () =>
     Promise.all([
-      loadMemory(db, params.workspaceId, customer.id),
+      memoriesPending,
       resolveProductId(
         db,
         params.workspaceId,
@@ -262,13 +347,15 @@ export async function runExtraction(
       ),
     ])
   );
-  const vectorStore = deps.vectorStore ?? getVectorStore();
   const context = await timed("context", () =>
     buildAIContext(db, vectorStore, {
       workspaceId: params.workspaceId,
       query: customerText,
       productId: productId ?? undefined,
-      knowledgeLimit: 4,
+      // P18 — نفس حدود الصفحة تُطبَّق على المعرفة/الأسئلة الجاهزة.
+      allowedProductIds,
+      knowledgeLimit: KNOWLEDGE_LIMIT,
+      preloadedChunks: chunksPending,
     })
   );
 
@@ -308,6 +395,7 @@ export async function runExtraction(
           conversationId: conversation.id,
           quantity: extraction.entities.quantity ?? null,
           recordEvents: !params.dryRun,
+          allowedProductIds,
         });
       }
     } catch (err) {
@@ -350,6 +438,8 @@ export async function runExtraction(
       plan,
       extractionUser,
       salesPlan,
+      catalogBoundary,
+      recallGuard,
     },
   };
 }
@@ -363,25 +453,25 @@ async function resolveProductId(
   // this workspace (legacy: every product may answer); [] = catalogs
   // exist but this page resolves none (nothing may answer).
   allowedIds?: string[] | null,
-  // Newest-first history. Only consulted when the customer asks for a
-  // picture and the current message names no product: «ورجيني الصورة»
-  // must still find the product discussed moments ago.
+  // Newest-first history. Only consulted when the current message names no
+  // product and either asks for a picture («ورجيني الصورة») or follows up
+  // on the product just discussed («قديش سعره» · «تمام بدي اطلب»).
   history: { senderType: string; text: string | null }[] = []
 ): Promise<string | null> {
   const candidates: string[] = [];
   if (extraction.entities.product) candidates.push(extraction.entities.product);
   // Context-based fallback: match product names against words in the message
   // ("بدي 3" after a product mention resolves via this path).
-  candidates.push(...productCandidatesFromText(customerText));
+  candidates.push(...productSearchWords(customerText));
   const direct = await findProductId(db, workspaceId, candidates, allowedIds);
   if (direct) return direct;
-  if (wantsMedia(customerText) === null) return null;
+  if (wantsMedia(customerText) === null && !refersToDiscussedProduct(extraction)) return null;
   for (const past of history) {
     if (!past.text || past.text === customerText) continue;
     const found = await findProductId(
       db,
       workspaceId,
-      productCandidatesFromText(past.text),
+      productSearchWords(past.text),
       allowedIds
     );
     if (found) return found;
@@ -389,14 +479,25 @@ async function resolveProductId(
   return null;
 }
 
-/** Words long enough to be a product-name fragment (bounded to 12). */
-function productCandidatesFromText(text: string): string[] {
-  const out: string[] = [];
-  for (const word of text.split(/[\s،,.!؟?]+/)) {
-    if (word.length >= 3) out.push(word);
-    if (out.length >= 12) break;
-  }
-  return out;
+/**
+ * Follow-ups about "it" — price, stock, usage, ordering — mean the product
+ * discussed moments ago. Without it the reply had no trusted price, the model
+ * quoted the price from its own earlier reply, the price guard rejected that
+ * as UNSUPPORTED_PRICE twice, and the customer got no reply at all.
+ * Greetings, delivery, complaints and unknown text keep no product.
+ */
+const PRODUCT_FOLLOW_UP_INTENTS = new Set([
+  "PRODUCT_QUESTION",
+  "PRICE_QUESTION",
+  "AVAILABILITY",
+  "HOW_TO_USE",
+  "BENEFITS",
+  "ORDER_CREATE",
+  "ORDER_UPDATE",
+]);
+
+function refersToDiscussedProduct(extraction: ExtractionResult): boolean {
+  return PRODUCT_FOLLOW_UP_INTENTS.has(extraction.intent) || extraction.requestedAction === "CREATE_ORDER";
 }
 
 /** Single query for all candidates (latency fix: never N sequential reads). */
@@ -408,13 +509,13 @@ async function findProductId(
 ): Promise<string | null> {
   if (!candidates.length) return null;
   if (allowedIds && allowedIds.length === 0) return null;
-  const ors: { name: { contains: string } }[] = [];
+  const ors: { name: { contains: string; mode: "insensitive" } }[] = [];
   for (const name of candidates.slice(0, 12)) {
-    ors.push({ name: { contains: name } });
+    ors.push({ name: { contains: name, mode: "insensitive" } });
     const cleaned = name.replace(/^(ال|الـ)/, "");
-    if (cleaned !== name) ors.push({ name: { contains: cleaned } });
+    if (cleaned !== name) ors.push({ name: { contains: cleaned, mode: "insensitive" } });
   }
-  const product = await db.product.findFirst({
+  const products = await db.product.findMany({
     where: {
       workspaceId,
       isActive: true,
@@ -422,9 +523,31 @@ async function findProductId(
       ...(allowedIds ? { id: { in: allowedIds } } : {}),
       OR: ors,
     },
-    select: { id: true },
+    select: { id: true, name: true },
+    take: 50,
   });
-  return product?.id ?? null;
+  const direct = pickBestProductMatch(candidates.slice(0, 12), products);
+  if (direct) return direct;
+
+  // ⚠️ البحث فوق حرفي: «ماء الكماة» ما بتطابق «ماء الكمأ»، فالرد بيطلع بلا
+  // سعر مع إن السعر مسجّل. 🔧 محاولة تانية بعد التطبيع العربي (الهمزات ·
+  // التاء المربوطة · الألف المقصورة · التشكيل) على منتجات الصفحة بس.
+  const scope = (await db.product.findMany({
+    where: {
+      workspaceId,
+      isActive: true,
+      isArchived: false,
+      ...(allowedIds ? { id: { in: allowedIds } } : {}),
+    },
+    select: { id: true, name: true, aliases: true },
+    take: 500,
+  })) as Array<{ id: string; name: string; aliases?: string[] | null }>;
+  // الاسم التاني (من الـ OMS) بيتعامل معاملة الاسم الأصلي بالبحث.
+  const searchable = scope.flatMap((p) => [
+    { id: p.id, name: p.name },
+    ...(p.aliases ?? []).filter((a) => a && a.trim().length > 0).map((a) => ({ id: p.id, name: a })),
+  ]);
+  return matchProductByAnyName(candidates.slice(0, 12), searchable)?.id ?? null;
 }
 
 function buildPlan(

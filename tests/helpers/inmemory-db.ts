@@ -197,7 +197,7 @@ function makeModel(name: string, store: Row[], defaults: Row = {}) {
     },
     async create(args: any) {
       const row: Row = {
-        id: `c-${name}-${store.length + 1}-${Math.random().toString(36).slice(2, 8)}`,
+        id: `c-${name}-${String(store.length + 1).padStart(6, "0")}-${Math.random().toString(36).slice(2, 8)}`,
         createdAt: new Date(),
         updatedAt: new Date(),
         ...defaults,
@@ -229,6 +229,11 @@ function makeModel(name: string, store: Row[], defaults: Row = {}) {
         campaign: (r, w) => w.externalIdempotencyKey != null && r.workspaceId === w.workspaceId && r.externalIdempotencyKey === w.externalIdempotencyKey,
         // Page catalogs — mirrors the real @@unique constraints.
         catalog: (r, w) => r.workspaceId === w.workspaceId && r.name === w.name,
+        // Orders mirror the real unique keys: idempotencyKey (@unique,
+        // nullable) and orderNumber (@unique).
+        order: (r, w) =>
+          (w.idempotencyKey != null && r.idempotencyKey === w.idempotencyKey) ||
+          (w.orderNumber != null && r.orderNumber === w.orderNumber),
       };
       const uniq = uniqMap[name];
       if (uniq) {
@@ -333,7 +338,7 @@ function makeModel(name: string, store: Row[], defaults: Row = {}) {
           if (dup) continue;
         }
         store.push({
-          id: `c-${name}-${store.length + 1}-${Math.random().toString(36).slice(2, 8)}`,
+          id: `c-${name}-${String(store.length + 1).padStart(6, "0")}-${Math.random().toString(36).slice(2, 8)}`,
           createdAt: new Date(),
           updatedAt: new Date(),
           ...defaults,
@@ -412,6 +417,8 @@ export function createFakeDb() {
   const customerIntelRunRows: Row[] = [];
   // البيانات المطلوب تجميعها (إعداد لكل مساحة).
   const collectionFieldSettingRows: Row[] = [];
+  // P19 — إشعار الطلبات الجاهزة على تيليجرام.
+  const telegramOrderSettingsRows: Row[] = [];
 
   const db = {
     _stores: {
@@ -441,12 +448,13 @@ export function createFakeDb() {
       customerIntel: customerIntelRows,
       customerIntelRun: customerIntelRunRows,
       collectionFieldSetting: collectionFieldSettingRows,
+      telegramOrderSettings: telegramOrderSettingsRows,
     },
     customer: makeModel("customer", customer, { status: "NEW_LEAD", tags: [], isActive: true, isArchived: false, isApproved: false, deletedAt: null, leadScore: 0, marketingConsent: "UNKNOWN", marketingOptOutAt: null, marketingConsentAt: null }),
     conversation: makeModel("conversation", conversation, { status: "OPEN", aiState: "AI_ACTIVE", aiEnabled: true, priority: "NORMAL", unreadCount: 0, tags: [], isActive: true, isArchived: false, isApproved: false, deletedAt: null }),
     message: makeModel("message", message, { deliveryStatus: "PENDING", isNote: false, metadata: {}, tags: [], isActive: true, isArchived: false, isApproved: false, deletedAt: null }),
     channelIdentity: makeModel("channelIdentity", channelIdentity, { tags: [], isActive: true, isArchived: false, isApproved: false, deletedAt: null }),
-    channel: makeModel("channel", channel, { tags: [], isActive: true, isArchived: false, isApproved: false, deletedAt: null }),
+    channel: makeModel("channel", channel, { orderRequiredFields: ["product", "quantity", "phone", "address"], tags: [], isActive: true, isArchived: false, isApproved: false, deletedAt: null }),
     workspaceMember: makeModel("workspaceMember", workspaceMember, { tags: [], isActive: true, isArchived: false, isApproved: false, deletedAt: null }),
     auditLog: makeModel("auditLog", auditLog, { tags: [], isActive: true, isArchived: false, isApproved: false, deletedAt: null }),
     product: makeModel("product", product, { currency: "USD", stockStatus: "IN_STOCK", stockQty: 0, tags: [], benefits: [], objections: [], isActive: true, isArchived: false, isApproved: false, deletedAt: null }),
@@ -479,7 +487,7 @@ export function createFakeDb() {
     aIUsageLog: makeModel("aIUsageLog", aIUsageLog, { promptTokens: 0, completionTokens: 0, costUsd: 0, latencyMs: 0, success: true, status: "SUCCESS", personaId: null, personaVersion: null, fallbackUsed: false, handoffReason: null, tags: [], isActive: true, isArchived: false, isApproved: false, deletedAt: null }),
     order: makeModel("order", orderRows, { status: "NEW", confirmationStatus: "PENDING", paymentStatus: "UNPAID", fulfillmentStatus: "UNFULFILLED", subtotal: 0, discount: 0, deliveryFee: 0, total: 0, currency: "USD", source: "AI", tags: [], isActive: true, isArchived: false, isApproved: false, deletedAt: null }),
     orderItem: makeModel("orderItem", orderItemRows, { tags: [], isActive: true, isArchived: false, isApproved: false, deletedAt: null }),
-    orderDraft: makeModel("orderDraft", orderDraftRows, { state: "COLLECTING", missingFields: [], phone: null, productId: null, quantity: null, rawAddress: null, province: null, customerName: null, tags: [], isActive: true, isArchived: false, isApproved: false, deletedAt: null }),
+    orderDraft: makeModel("orderDraft", orderDraftRows, { state: "COLLECTING", sequence: 1, missingFields: [], items: [], phone: null, productId: null, quantity: null, rawAddress: null, province: null, customerName: null, orderId: null, tags: [], isActive: true, isArchived: false, isApproved: false, deletedAt: null }),
     deliveryRule: makeModel("deliveryRule", deliveryRuleRows, { fee: 0, isAvailable: true, tags: [], isActive: true, isArchived: false, isApproved: false, deletedAt: null }),
     salesEvent: makeModel("salesEvent", salesEventRows, { payload: {}, tags: [], isActive: true, isArchived: false, isApproved: false, deletedAt: null }),
     audienceSegment: makeModel("audienceSegment", audienceSegmentRows, { description: null, isActive: true, tags: [], isArchived: false, isApproved: false, deletedAt: null }),
@@ -504,6 +512,7 @@ export function createFakeDb() {
     customerIntel: makeModel("customerIntel", customerIntelRows, { status: "PENDING", data: {}, fieldMeta: {}, confidence: 0, attempts: 0, lastError: null, extractedAt: null, reviewedAt: null, reviewedBy: null, lastMessageId: null }),
     customerIntelRun: makeModel("customerIntelRun", customerIntelRunRows, { status: "QUEUED", provider: null, model: null, latencyMs: null, errorCode: null, startedAt: null, finishedAt: null }),
     collectionFieldSetting: makeModel("collectionFieldSetting", collectionFieldSettingRows, { kind: "TEXT", required: false, enabled: true, sortOrder: 0, isCustom: false }),
+    telegramOrderSettings: makeModel("telegramOrderSettings", telegramOrderSettingsRows, { enabled: false }),
   };
 
   const conversationModel = db.conversation as any;
@@ -838,6 +847,29 @@ export function createFakeDb() {
       });
     }
     return result;
+  };
+
+  // P15 — معاملة تفاعلية مثل Prisma: لقطة من كل المخازن، واسترجاعها عند أي
+  // خطأ. تُستخدم لاختبار «فشل التدقيق يلغي تحديث العميل». المعاملة لا تُعرّض
+  // $transaction نفسها (مثل عميل Prisma داخل معاملة) حتى لا تتشعّب المعاملات.
+  (db as any).$transaction = async (fn: (tx: typeof db) => Promise<unknown>) => {
+    const snapshot = Object.entries(db._stores).map(
+      ([key, store]) => [key, (store as Row[]).map((row) => ({ ...row }))] as const
+    );
+    const saved = (db as any).$transaction;
+    delete (db as any).$transaction;
+    try {
+      return await fn(db);
+    } catch (err) {
+      for (const [key, rows] of snapshot) {
+        const store = (db._stores as Record<string, Row[]>)[key];
+        store.length = 0;
+        store.push(...rows);
+      }
+      throw err;
+    } finally {
+      (db as any).$transaction = saved;
+    }
   };
 
   allStores = db._stores;

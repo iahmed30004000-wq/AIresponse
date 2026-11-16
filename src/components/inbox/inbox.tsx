@@ -10,6 +10,7 @@ import { Button } from "../ui/button";
 import { ConfirmDialog, ErrorState } from "../ui/confirm";
 import { Dialog, Drawer } from "../ui/dialog";
 import { EmptyState } from "../ui/empty-state";
+import { useRealtime } from "../realtime/use-realtime";
 import { Input, Select } from "../ui/input";
 import { Skeleton } from "../ui/skeleton";
 import { useToast } from "../ui/toast";
@@ -84,7 +85,7 @@ export default function Inbox() {
   const [sending, setSending] = useState(false);
   const [draft, setDraft] = useState("");
   const [cursor, setCursor] = useState<string | null>(null);
-  const [orderDraftCard, setOrderDraftCard] = useState<DraftInfo | null>(null);
+  const [orderDrafts, setOrderDrafts] = useState<DraftInfo[]>([]);
   const [confirmDelete, setConfirmDelete] = useState(false);
   const [deleting, setDeleting] = useState(false);
   const [confirmTakeover, setConfirmTakeover] = useState(false);
@@ -129,9 +130,13 @@ export default function Inbox() {
     const res = await fetch(`/api/order-drafts?conversationId=${conversationId}`);
     if (res.ok) {
       const data = await res.json();
-      setOrderDraftCard(data.items[0] ?? null);
+      // كل منتج مسودة مستقلة — نعرض المفتوحة كلها (الأحدث أولًا من الخادم).
+      const open = (data.items ?? []).filter((d: DraftInfo) =>
+        ["EMPTY", "COLLECTING", "READY", "CONFIRMING"].includes(d.state)
+      );
+      setOrderDrafts(open);
     } else {
-      setOrderDraftCard(null);
+      setOrderDrafts([]);
     }
   }
 
@@ -184,16 +189,34 @@ export default function Inbox() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [fetchList]);
 
-  // 20s polling
+  // ── Realtime: SSE يجيب الرسائل لحظيًا؛ polling بطيء احتياطي فقط ──
+  const selectedIdRef = useRef<string | null>(null);
+  selectedIdRef.current = selectedId;
+  const [realtimeOpen, setRealtimeOpen] = useState(false);
+  useRealtime(
+    (change) => {
+      void fetchList();
+      const current = selectedIdRef.current;
+      if (current && (!change.conversationId || change.conversationId === current)) {
+        void refreshMessages(current);
+        if (change.type === "message.inbound") void loadDraft(current);
+      }
+    },
+    { onStatus: (status) => setRealtimeOpen(status === "open") }
+  );
+
+  // احتياطي: 60 ثانية إذا SSE شغّال، و5 ثوانٍ إذا انقطع.
   useEffect(() => {
-    const interval = setInterval(() => {
-      fetchList();
-      if (selectedId) refreshMessages(selectedId);
-    }, 20000);
+    const interval = setInterval(
+      () => {
+        fetchList();
+        if (selectedId) refreshMessages(selectedId);
+      },
+      realtimeOpen ? 60000 : 5000
+    );
     return () => clearInterval(interval);
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [fetchList, selectedId]);
-
+  }, [fetchList, selectedId, realtimeOpen]);
   const refreshMessages = useCallback(async (conversationId: string) => {
     const seq = ++msgSeq.current;
     const res = await fetch(`/api/conversations/${conversationId}/messages`);
@@ -358,7 +381,7 @@ export default function Inbox() {
       setSelectedId(null);
       setMessages([]);
       setCustomer(null);
-      setOrderDraftCard(null);
+      setOrderDrafts([]);
       setConfirmDelete(false);
       toast.show(t.inbox.deleteConversationDone, "success");
     } catch {
@@ -408,8 +431,33 @@ export default function Inbox() {
   }
 
   // P8 — مساعد البيع: اقتراحات داخلية فقط، لا يُرسل شيء تلقائيًا.
-  async function loadCoach(conversationId: string) {
-    setCoachLoading(true);
+  // P21 — تحديث اسم/صورة العميل من فيسبوك بطلب الموظف (يتجاوز الكاش السلبي).
+  async function refreshCustomerProfile(): Promise<{ ok: boolean; message: string }> {
+    if (!customer) return { ok: false, message: "ما في عميل محدد." };
+    try {
+      const res = await fetch(`/api/customers/${customer.id}/refresh-profile`, { method: "POST" });
+      const data = (await res.json().catch(() => null)) as { ok?: boolean; message?: string } | null;
+      if (res.ok && data?.ok) {
+        const fresh = await fetch(`/api/customers/${customer.id}`);
+        if (fresh.ok) setCustomer((await fresh.json()) as CustomerDetail);
+      }
+      return { ok: Boolean(data?.ok), message: data?.message ?? (res.ok ? "تم التحديث." : "تعذّر التحديث.") };
+    } catch {
+      return { ok: false, message: "تعذّر الاتصال بالخادم." };
+    }
+  }
+
+  async function resetConversationMemory() {
+    if (!selectedId) return;
+    const res = await fetch(`/api/conversations/${selectedId}/memory/reset`, { method: "POST" });
+    if (!res.ok) {
+      toast.show("تعذّر حذف ذاكرة المحادثة", "error");
+      return;
+    }
+    toast.show("انحذفت ذاكرة المحادثة", "info");
+  }
+
+  async function loadCoach(conversationId: string) {    setCoachLoading(true);
     setCoachError(false);
     try {
       // OCR-2026-10-16 #9: body فاضي كان باربع INVALID_BODY دايمًا — المسار
@@ -604,6 +652,9 @@ export default function Inbox() {
                 </div>
               </div>
               <div className="flex flex-wrap items-center gap-1.5">
+                <Badge tone={realtimeOpen ? "DELIVERED" : "PENDING"} dot>
+                  {realtimeOpen ? "مباشر" : "غير متصل"}
+                </Badge>
                 <Badge tone={aiMode ? "AI_ACTIVE" : "HUMAN_ACTIVE"} dot>
                   <Bot size={11} />
                   {aiMode ? t.inbox.replyWithAi : t.inbox.replyManually}
@@ -801,16 +852,19 @@ export default function Inbox() {
       <aside className="glass hidden w-72 shrink-0 overflow-y-auto rounded-2xl xl:block">
         <CustomerPanel
           customer={customer}
-          orderDraft={orderDraftCard}
+          orderDrafts={orderDrafts}
           pageName={selected ? pageNameOf(selected) : null}
+          onRefreshProfile={refreshCustomerProfile}
+          onResetMemory={resetConversationMemory}
         />
       </aside>
       <Drawer open={panelOpen} onClose={() => setPanelOpen(false)} side="end" until="xl" title="ملف العميل">
         <div className="overflow-y-auto">
           <CustomerPanel
             customer={customer}
-            orderDraft={orderDraftCard}
+            orderDrafts={orderDrafts}
             pageName={selected ? pageNameOf(selected) : null}
+            onResetMemory={resetConversationMemory}
           />
         </div>
       </Drawer>

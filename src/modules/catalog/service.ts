@@ -1,6 +1,6 @@
 import type { Db } from "@/modules/customers/service";
 import { AppError, ConflictError, NotFoundError } from "@/core/errors";
-import { CUSTOMER_INBOUND } from "@/modules/media/service";
+import { isProductPhotoCategory } from "@/modules/media/service";
 
 /**
  * PAGE CATALOGS — WHICH PRODUCTS EACH PAGE MAY ANSWER WITH.
@@ -110,8 +110,24 @@ export async function updateCatalog(
  * else in the schema points at catalogs (orders point at products), so no
  * historical row loses its meaning; the audit row records who did it.
  */
-export async function deleteCatalog(db: Db, workspaceId: string, catalogId: string) {
+export async function deleteCatalog(
+  db: Db,
+  workspaceId: string,
+  catalogId: string,
+  opts: { force?: boolean } = {}
+) {
   await ownCatalog(db, workspaceId, catalogId);
+  // آخر كتالوج + صفحات مربوطة فيه: حذفه بيرجّع النظام للوضع القديم (كل المنتجات
+  // مفتوحة على كل الصفحات). ما بنسمح إلا بتأكيد صريح.
+  if (!opts.force) {
+    const total = await db.catalog.count({ where: { workspaceId } });
+    const assigned = await db.catalogPageAssignment.count({ where: { catalogId } });
+    if (total === 1 && assigned > 0) {
+      throw new ConflictError(
+        "هذا آخر كتالوج وفيه صفحات مربوطة — حذفه بيفتح كل المنتجات على كل الصفحات. أعد الطلب بـ force=1 للتأكيد."
+      );
+    }
+  }
   // Links first, then the catalog: explicit on every database (the schema
   // also cascades, as a second guarantee). Products are never touched.
   await db.catalogProduct.deleteMany({ where: { catalogId } });
@@ -271,16 +287,30 @@ export async function workspaceHasCatalogs(db: Db, workspaceId: string): Promise
   return n > 0;
 }
 
-/** Product ids of an active catalog, oldest-link first. Empty when none. */
-export async function catalogProductIds(db: Db, workspaceId: string, catalogId: string): Promise<string[]> {
-  const catalog = await ownCatalog(db, workspaceId, catalogId);
+/** Active, non-archived product ids of an active catalog, oldest-link first. Empty when none. */
+export async function catalogProductIds(
+  db: Db,
+  workspaceId: string,
+  catalogId: string,
+  // The row the caller just resolved inside this workspace: no second read.
+  resolved?: Pick<CatalogRow, "id" | "isActive">
+): Promise<string[]> {
+  const catalog = resolved?.id === catalogId ? resolved : await ownCatalog(db, workspaceId, catalogId);
   if (!catalog.isActive) return [];
   const rows = (await db.catalogProduct.findMany({
     where: { catalogId },
     orderBy: [{ sortOrder: "asc" }, { createdAt: "asc" }],
     select: { productId: true },
   })) as { productId: string }[];
-  return rows.map((r) => r.productId);
+  if (!rows.length) return [];
+  // Two reads, same as getCatalogDetail: a linked product that was archived or
+  // stopped leaves the page's allowed set (its FAQs and documents with it).
+  const live = (await db.product.findMany({
+    where: { id: { in: rows.map((r) => r.productId) }, workspaceId, isActive: true, isArchived: false },
+    select: { id: true },
+  })) as { id: string }[];
+  const liveIds = new Set(live.map((p) => p.id));
+  return rows.map((r) => r.productId).filter((id) => liveIds.has(id));
 }
 
 /**
@@ -296,7 +326,7 @@ export async function buildPageProductContext(db: Db, workspaceId: string, chann
   if (resolved.status !== "ok" || !resolved.catalog) {
     return { catalog: null, status: resolved.status, products: [] as unknown[] };
   }
-  const ids = await catalogProductIds(db, workspaceId, resolved.catalog.id);
+  const ids = await catalogProductIds(db, workspaceId, resolved.catalog.id, resolved.catalog);
   if (!ids.length) return { catalog: resolved.catalog, status: "ok" as const, products: [] as unknown[] };
   const products = (await db.product.findMany({
     where: { id: { in: ids }, workspaceId, isActive: true, isArchived: false },
@@ -328,16 +358,16 @@ export async function buildPageProductContext(db: Db, workspaceId: string, chann
   }[];
   for (const j of joins) {
     if (j.mediaAsset?.type !== "IMAGE") continue;
-    if (j.mediaAsset.category === CUSTOMER_INBOUND) continue;
+    if (!isProductPhotoCategory(j.mediaAsset.category)) continue;
     const arr = imagesByProduct.get(j.productId) ?? [];
     if (arr.length < 3 && !arr.includes(j.mediaAsset.url)) arr.push(j.mediaAsset.url);
     imagesByProduct.set(j.productId, arr);
   }
   for (const m of media) {
     if (!m.productId) continue;
-    if (m.category === CUSTOMER_INBOUND) continue;
+    if (!isProductPhotoCategory(m.category)) continue;
     const arr = imagesByProduct.get(m.productId) ?? [];
-    if (arr.length < 3) arr.push(m.url);
+    if (arr.length < 3 && !arr.includes(m.url)) arr.push(m.url);
     imagesByProduct.set(m.productId, arr);
   }
   return {

@@ -1,5 +1,5 @@
 import { childLogger } from "@/core/logger";
-import { processPendingJobs, type JobHandler } from "@/modules/jobs/service";
+import { processPendingJobs, enqueueJob, type JobHandler } from "@/modules/jobs/service";
 import { handleChannelInbound } from "@/modules/channels/inbound-job";
 import { handleWhatsAppMediaDownload } from "@/modules/channels/whatsapp/media-download";
 import { getEmbeddingProvider, getCurrentEmbeddingIdentity } from "@/modules/knowledge/embeddings";
@@ -191,8 +191,12 @@ async function handleProcessMedia(db: HandlerDb, payload: Record<string, unknown
   return { success: true };
 }
 
+// The ordering guard decides on every retry; the queue enforces the floor and
+// the back-off (deferDelayMs), so this short delay cannot hot-loop.
+export const AI_DEFERRED_RETRY_MS = 1_000;
+
 /** process_ai_message: runs the AI orchestrator for one inbound message. */
-async function handleProcessAIMessage(db: HandlerDb, payload: Record<string, unknown>, workspaceId: string): Promise<{ success: boolean; error?: string }> {
+async function handleProcessAIMessage(db: HandlerDb, payload: Record<string, unknown>, workspaceId: string): Promise<{ success: boolean; error?: string; deferMs?: number }> {
   // Fail loudly instead of silently no-oping: an empty workspace context made
   // gating return SKIPPED, the job complete DONE, and the orphan sweeper
   // re-enqueue the same message forever (silent hot loop with zero logs).
@@ -211,6 +215,11 @@ async function handleProcessAIMessage(db: HandlerDb, payload: Record<string, unk
   if (result.status === "AI_FAILED") {
     return { success: false, error: result.error ?? "AI failed" };
   }
+  // An older message of this conversation is still being answered (possibly by
+  // another worker). Retry shortly so this message still gets its reply.
+  if (result.status === "DEFERRED") {
+    return { success: true, deferMs: AI_DEFERRED_RETRY_MS };
+  }
   return { success: true };
 }
 
@@ -220,20 +229,46 @@ async function handleProcessAIMessage(db: HandlerDb, payload: Record<string, unk
  * 1000 chunks + JSON.parse embeddings on EVERY message (latency fix).
  * Read-only snapshot semantics: a 60s delay in seeing new docs is acceptable.
  */
-const vectorStoreCache = new Map<string, { at: number; store: Awaited<ReturnType<typeof buildWorkspaceVectorStoreUncached>> }>();
+type WorkspaceVectorStore = Awaited<ReturnType<typeof buildWorkspaceVectorStoreUncached>>;
+const vectorStoreCache = new Map<string, { at: number; store: WorkspaceVectorStore }>();
+const vectorStoreLoading = new Map<string, Promise<WorkspaceVectorStore>>();
 const VECTOR_STORE_CACHE_MS = 60_000;
 
+/**
+ * Stale-while-revalidate: once a workspace has a store, an expired one is
+ * still served and the reload runs in the background — the minute-old copy
+ * is the same 60s staleness already accepted, and the reload (up to 1000
+ * rows + JSON.parse) no longer sits in front of a customer's reply. Only the
+ * very first message of a workspace in this process waits for the load.
+ */
 async function buildWorkspaceVectorStore(db: HandlerDb, workspaceId: string) {
   const cached = vectorStoreCache.get(workspaceId);
   if (cached && Date.now() - cached.at < VECTOR_STORE_CACHE_MS) return cached.store;
-  const store = await buildWorkspaceVectorStoreUncached(db, workspaceId);
-  vectorStoreCache.set(workspaceId, { at: Date.now(), store });
-  // Bound cache to avoid unbounded workspace growth in long-lived workers.
-  if (vectorStoreCache.size > 200) {
-    const oldest = [...vectorStoreCache.entries()].sort((a, b) => a[1].at - b[1].at)[0]?.[0];
-    if (oldest) vectorStoreCache.delete(oldest);
-  }
-  return store;
+  const loading = loadWorkspaceVectorStore(db, workspaceId);
+  if (!cached) return loading;
+  loading.catch((err) => {
+    log.warn({ workspaceId, error: err instanceof Error ? err.message : String(err) }, "vector_store_refresh_failed");
+  });
+  return cached.store;
+}
+
+/** One load per workspace at a time; concurrent replies share it. */
+function loadWorkspaceVectorStore(db: HandlerDb, workspaceId: string): Promise<WorkspaceVectorStore> {
+  const inFlight = vectorStoreLoading.get(workspaceId);
+  if (inFlight) return inFlight;
+  const loading = buildWorkspaceVectorStoreUncached(db, workspaceId)
+    .then((store) => {
+      vectorStoreCache.set(workspaceId, { at: Date.now(), store });
+      // Bound cache to avoid unbounded workspace growth in long-lived workers.
+      if (vectorStoreCache.size > 200) {
+        const oldest = [...vectorStoreCache.entries()].sort((a, b) => a[1].at - b[1].at)[0]?.[0];
+        if (oldest) vectorStoreCache.delete(oldest);
+      }
+      return store;
+    })
+    .finally(() => vectorStoreLoading.delete(workspaceId));
+  vectorStoreLoading.set(workspaceId, loading);
+  return loading;
 }
 
 async function buildWorkspaceVectorStoreUncached(db: HandlerDb, workspaceId: string) {
@@ -372,24 +407,10 @@ export async function handleProcessWebhookEvent(db: HandlerDb, payload: Record<s
     channelId = undefined;
   }
 
-  const { getFacebookClient } = await import("@/modules/channels/facebook/client");
-  const { resolveSenderName } = await import("@/modules/channels/facebook/profile");
-  const fbClient = getFacebookClient();
-  // Profile lookups for the whole batch run concurrently (each is throttled +
-  // cached inside resolveSenderName), so a 10-message batch doesn't pay
-  // N×4s sequential Graph timeouts before the first message is ingested.
-  const profileResults = await Promise.all(
-    messages.map(async (m) => {
-      const psid = String(m.externalCustomerId ?? "");
-      try {
-        const resolved = await resolveSenderName(db, { workspaceId, psid, pageToken, client: fbClient });
-        return { psid, name: resolved.name, avatar: resolved.avatarUrl };
-      } catch {
-        return { psid, name: null, avatar: null };
-      }
-    })
-  );
-  const profileByPsid = new Map(profileResults.map((r) => [r.psid, r]));
+  // P17 — صورة/اسم المرسل من Graph ما بيتحطّوا على مسار الرد. قبل هالتعديل
+  // كان الويب هوك يستنى نداء Graph لكل PSID جديد (حتى 4 ثوانٍ) **قبل** حفظ
+  // الرسالة وتصفيف مهمة الرد، فيتأخر أول رد على زبون جديد بكل النداء. هلق
+  // الرسالة تنحفظ فورًا، ومهمة تجميلية مستقلة تجيب الاسم بعدين.
   // PERF — ingest conversation groups concurrently, strictly sequential
   // inside one conversation (see processInboundGroups): a 10-PSID batch no
   // longer pays N serial DB pipelines; same-conversation order is preserved.
@@ -399,19 +420,17 @@ export async function handleProcessWebhookEvent(db: HandlerDb, payload: Record<s
     run: async (m) => {
       const mm = m as Record<string, unknown>;
       const psid = String(mm.externalCustomerId ?? "");
-      // Best-effort sender profile (throttled, cached): fills Customer.name /
-      // avatarUrl so the inbox shows real identity instead of fallbacks.
-      // Never blocks ingestion on failure — falls through to nulls.
-      const prof = profileByPsid.get(psid);
-      const senderName: string | null = prof?.name ?? null;
-      const senderAvatar: string | null = prof?.avatar ?? null;
+      // ما بيجي اسم مع ويب هوك ماسنجر عادةً — الاسم بيوصل بمهمة البروفايل
+      // المستقلة بعد الحفظ، فما بيعطّل الرد.
+      const senderName = (mm.externalUserName as string | undefined) ?? undefined;
+      const senderAvatar = (mm.externalAvatarUrl as string | undefined) ?? undefined;
       await processIncomingMessage(db, {
         workspaceId,
         channelType: "FACEBOOK",
         channelId,
         externalUserId: psid,
-        externalUserName: (mm.externalUserName as string | undefined) ?? senderName ?? undefined,
-        externalAvatarUrl: (mm.externalAvatarUrl as string | undefined) ?? senderAvatar ?? undefined,
+        externalUserName: senderName,
+        externalAvatarUrl: senderAvatar,
         externalConversationId: String(mm.externalConversationId ?? ""),
         externalMessageId: String(mm.externalMessageId ?? ""),
         externalEventId: String(mm.externalEventId ?? ""),
@@ -438,6 +457,34 @@ export async function handleProcessWebhookEvent(db: HandlerDb, payload: Record<s
       );
     },
   });
+
+  // P17 — مهمة اسم/صورة المرسل: تجميلية، مستقلة، وبلا أي أثر على سرعة الرد.
+  // واحدة لكل حدث ويب هوك (كل الـ PSIDs مرة وحدة) لتقليل صفوف الطابور.
+  if (pageToken && channelAccountId) {
+    const psids = [
+      ...new Set(
+        messages
+          .map((m) => String((m as Record<string, unknown>).externalCustomerId ?? ""))
+          .filter(Boolean)
+      ),
+    ];
+    if (psids.length > 0) {
+      const queued = await enqueueJob(db, {
+        workspaceId,
+        type: "resolve_sender_profile",
+        payload: { channelAccountId, psids },
+        idempotencyKey: `profile:${workspaceId}:${webhookEventId}`,
+        maxAttempts: 2,
+      }).catch((err) => {
+        log.warn(
+          { webhookEventId, workspaceId, error: err instanceof Error ? err.message : String(err) },
+          "profile_job_enqueue_failed"
+        );
+        return null;
+      });
+      void queued;
+    }
+  }
 
   // P12: إحالات بلا رسالة → لمسات إسناد (أفضل جهد — لا تفشل الدفعة).
   const signals = (payload.referralSignals as Array<Record<string, unknown>> | undefined) ?? [];
@@ -468,6 +515,129 @@ export async function handleProcessWebhookEvent(db: HandlerDb, payload: Record<s
   return failed > 0
     ? { success: false, error: `${failed} message(s) failed` }
     : { success: true };
+}
+
+/**
+ * P17 — resolve_sender_profile: اسم/صورة المرسل من Graph، خارج مسار الرد.
+ *
+ * لماذا مهمة مستقلة: ماسنجر ما بيبعت اسم الزبون مع الرسالة، وكود قديم كان
+ * يجيب الاسم **قبل** حفظ الرسالة (حتى 4 ثوانٍ لمهلة Graph). صار الحفظ والرد
+ * أولًا، والاسم يوصل بعدين وبيتحدّث على العميل/الهوية — بلا أي إرسال.
+ *
+ * الأمان: المساحة تُتحقق من صاحب الحساب قبل أي قراءة؛ التوكن بينفكّ لحظيًا
+ * وما بينحفظ بالحمولة؛ الفشل تجميلي وما بيفشّل شي.
+ */
+async function handleResolveSenderProfile(
+  db: HandlerDb,
+  payload: Record<string, unknown>,
+  workspaceId: string
+): Promise<{ success: boolean; error?: string }> {
+  if (!workspaceId) return { success: false, error: "MISSING_WORKSPACE_CONTEXT" };
+  const channelAccountId = String(payload.channelAccountId ?? "");
+  const psids = Array.isArray(payload.psids)
+    ? [...new Set(payload.psids.filter((p): p is string => typeof p === "string" && p.length > 0))]
+    : [];
+  if (!channelAccountId || psids.length === 0) return { success: true };
+
+  const account = await (db as any).channelAccount
+    .findUnique({ where: { id: channelAccountId }, select: { encryptedCredentials: true, channelId: true } })
+    .catch(() => null);
+  if (!account) {
+    log.warn({ workspaceId, channelAccountId }, "profile_job_account_unavailable");
+    return { success: true };
+  }
+  // العزل: الحساب لازم يكون تابع لقناة ضمن نفس المساحة — وإلا ما منلمس شي.
+  const channel = await (db as any).channel
+    .findFirst({ where: { id: account.channelId, workspaceId }, select: { id: true } })
+    .catch(() => null);
+  if (!channel) {
+    log.warn({ workspaceId, channelAccountId }, "profile_job_account_unavailable");
+    return { success: true };
+  }
+
+  let pageToken: string | null = null;
+  if (account.encryptedCredentials) {
+    try {
+      const { decryptSecret } = await import("@/core/crypto");
+      pageToken = decryptSecret(account.encryptedCredentials);
+    } catch {
+      pageToken = null;
+    }
+  }
+  if (!pageToken) return { success: true };
+
+  const { resolveSenderName } = await import("@/modules/channels/facebook/profile");
+  const { getFacebookClient } = await import("@/modules/channels/facebook/client");
+  const { resolveCustomerByChannelIdentity } = await import("@/modules/customers/service");
+  const client = getFacebookClient();
+
+  // كل الـ PSIDs دفعة وحدة (Promise.all) — موجة Graph وحدة كحد أقصى، لا N×4s.
+  const resolved = await Promise.all(
+    psids.map(async (psid) => {
+      try {
+        return { psid, ...(await resolveSenderName(db, { workspaceId, psid, pageToken, client })) };
+      } catch {
+        return { psid, name: null, avatarUrl: null, cached: true };
+      }
+    })
+  );
+
+  let updated = 0;
+  for (const r of resolved) {
+    if (!r.name && !r.avatarUrl) continue;
+    try {
+      // نفس دالة مسار الرسائل: workspace-check + لا تستبدل قيمة حقيقية بـnull.
+      await resolveCustomerByChannelIdentity(db, {
+        workspaceId,
+        channelType: "FACEBOOK",
+        externalUserId: r.psid,
+        displayName: r.name,
+        avatarUrl: r.avatarUrl,
+      });
+      updated += 1;
+    } catch {
+      // اسم تجميلي — ما بيفشّل المهمة ولا بيرجع للطابور.
+    }
+  }
+  log.info({ workspaceId, requested: psids.length, updated }, "sender_profile_job_done");
+  return { success: true };
+}
+
+/**
+ * P19 — notify_order_ready: يرسل بيانات الطلب الجاهز لمجموعة/توبيك تيليجرام.
+ *
+ * - المستقل: ما بيعطّل الرد ولا إنشاء الطلب (مهمة خلفية).
+ * - idempotent: مفتاح المهمة لكل مسودة/جيل، وفحص أثر سابق قبل الإرسال.
+ * - لا يرسل إذا: المسودة ما عادت READY/انحوّلت لطلب/انلغت، أو الإعدادات مطفية.
+ * - بيانات الزبون (اسم/هاتف/عنوان) تُرسل للمجموعة الخاصة التي حدّدها المالك فقط.
+ */
+/**
+ * notify_order_ready — DEPRECATED (قرار المالك: المسودة ما بتنرحّل لتلجرام).
+ *
+ * الترحيل صار عند إنشاء الطلب الرسمي فقط (order-service). الوظيفة باقية كـno-op
+ * عشان المهام القديمة اللي بالطابور تخلص بهدوء بلا إرسال ولا فشل.
+ */
+async function handleNotifyOrderReady(): Promise<{ success: boolean }> {
+  return { success: true };
+}
+
+/** notify_order_telegram: retries a failed order notification; failures back off. */
+async function handleNotifyOrderTelegram(
+  db: HandlerDb,
+  payload: Record<string, unknown>,
+  workspaceId: string
+): Promise<{ success: boolean; error?: string }> {
+  const { deliverOrderTelegram } = await import("@/modules/orders/telegram-delivery");
+  try {
+    await deliverOrderTelegram(db as never, {
+      workspaceId,
+      userId: String(payload.userId ?? "system"),
+      orderId: String(payload.orderId ?? ""),
+    });
+    return { success: true };
+  } catch (err) {
+    return { success: false, error: err instanceof Error ? err.message : String(err) };
+  }
 }
 
 /** evaluate_automation: runs the Automation Engine for one trusted event. */
@@ -543,59 +713,86 @@ async function handleExtractCustomerIntel(
 }
 
 export function getJobHandlers(): Record<string, JobHandler> {
+  // Capture the runner's DB once: detached jobs (P17 profile enrichment) may
+  // finish AFTER runJobs() returns and clears currentDb, so a lazy getDb() in
+  // the closure would throw "Job runner DB not initialized".
+  const db = getDb();
   return {
-    process_knowledge_document: (payload) => handleProcessDocument(getDb(), payload),
-    analyze_feedback: (payload) => handleAnalyzeFeedback(getDb(), payload),
-    process_media: (payload) => handleProcessMedia(getDb(), payload),
-    process_ai_message: (payload, jobId, workspaceId) =>
-      handleProcessAIMessage(getDb(), payload, workspaceId || currentWorkspaceId(jobId)),
-    generate_summary: (payload) => handleGenerateSummary(getDb(), payload),
-    process_webhook_event: (payload, jobId) => handleProcessWebhookEvent(getDb(), payload),
-    process_channel_inbound: (payload) => handleChannelInbound(getDb(), payload),
-    download_whatsapp_media: (payload) => handleWhatsAppMediaDownload(getDb(), payload),
-    evaluate_automation: (payload) => handleEvaluateAutomation(getDb(), payload),
-    process_due_followups: () => handleProcessDueFollowUps(getDb()),
-    aggregate_workspace_analytics: (payload) => handleAggregateAnalytics(getDb(), payload),
-    run_workflow_event: (payload) => handleRunWorkflowEvent(getDb(), payload),
-    resume_workflow_executions: () => handleResumeWorkflowExecutions(getDb()),
-    run_campaign: (payload) => handleRunCampaign(getDb(), payload),
-    campaign_tick: (payload) => handleCampaignTick(getDb(), payload),
-    validate_attribution_code: (payload) => handleValidateAttributionCode(getDb(), payload),
-    refresh_product_compliance: (payload, jobId, workspaceId) =>
-      handleRefreshProductCompliance(getDb(), payload, workspaceId || currentWorkspaceId(jobId)),
-    extract_customer_intel: (payload, jobId, workspaceId) =>
-      handleExtractCustomerIntel(getDb(), payload, workspaceId || currentWorkspaceId(jobId)),
+    process_knowledge_document: (payload) => handleProcessDocument(db, payload),
+    analyze_feedback: (payload) => handleAnalyzeFeedback(db, payload),
+    process_media: (payload) => handleProcessMedia(db, payload),
+    process_ai_message: (payload, _jobId, workspaceId) =>
+      handleProcessAIMessage(db, payload, workspaceId),
+    resolve_sender_profile: (payload, _jobId, workspaceId) =>
+      handleResolveSenderProfile(db, payload, workspaceId),
+    notify_order_ready: () => handleNotifyOrderReady(),
+    notify_order_telegram: (payload, _jobId, workspaceId) => handleNotifyOrderTelegram(db, payload, workspaceId),
+    generate_summary: (payload) => handleGenerateSummary(db, payload),
+    process_webhook_event: (payload, jobId) => handleProcessWebhookEvent(db, payload),
+    process_channel_inbound: (payload) => handleChannelInbound(db, payload),
+    download_whatsapp_media: (payload) => handleWhatsAppMediaDownload(db, payload),
+    evaluate_automation: (payload) => handleEvaluateAutomation(db, payload),
+    process_due_followups: () => handleProcessDueFollowUps(db),
+    aggregate_workspace_analytics: (payload) => handleAggregateAnalytics(db, payload),
+    run_workflow_event: (payload) => handleRunWorkflowEvent(db, payload),
+    resume_workflow_executions: () => handleResumeWorkflowExecutions(db),
+    run_campaign: (payload) => handleRunCampaign(db, payload),
+    campaign_tick: (payload) => handleCampaignTick(db, payload),
+    validate_attribution_code: (payload) => handleValidateAttributionCode(db, payload),
+    refresh_product_compliance: (payload, _jobId, workspaceId) =>
+      handleRefreshProductCompliance(db, payload, workspaceId),
+    extract_customer_intel: (payload, _jobId, workspaceId) =>
+      handleExtractCustomerIntel(db, payload, workspaceId),
+    handoff_order_to_oms: async (payload, _jobId, workspaceId) => {
+      const { handleAutoHandoffJob } = await import("@/modules/oms/auto-handoff");
+      return handleAutoHandoffJob(db as never, payload, workspaceId || String(payload.workspaceId ?? ""));
+    },
+    sync_oms_products: async (payload, _jobId, workspaceId) => {
+      const { handleProductSyncJob } = await import("@/modules/oms/auto-handoff");
+      return handleProductSyncJob(db as never, workspaceId || String(payload.workspaceId ?? ""));
+    },
   };
 }
 
 // The handlers receive the Prisma transaction client from the runner at call
 // time; we keep a module-level reference set by runJobs().
 let currentDb: HandlerDb | null = null;
-const jobWorkspaces = new Map<string, string>();
-
-function currentWorkspaceId(jobId: string): string {
-  return jobWorkspaces.get(jobId) ?? "";
-}
 
 function getDb(): HandlerDb {
   if (!currentDb) throw new Error("Job runner DB not initialized");
   return currentDb;
 }
 
-export async function runJobs(db: HandlerDb, opts?: { limit?: number; workerId?: string }) {
+export async function runJobs(
+  db: HandlerDb,
+  opts?: { limit?: number; workerId?: string; maintenance?: boolean; sameCycle?: boolean }
+) {
   currentDb = db;
-  // Track each job's workspace so handlers can scope tenant-isolated work.
-  const pending = await (db as any).backgroundJob.findMany({
-    where: { status: "PENDING", runAfter: { lte: new Date() } },
-    orderBy: { createdAt: "asc" },
-    take: opts?.limit ?? 10,
-    select: { id: true, workspaceId: true },
-  });
-  jobWorkspaces.clear();
-  for (const j of pending) jobWorkspaces.set(j.id, j.workspaceId);
   try {
     return await processPendingJobs(db, getJobHandlers(), opts);
   } finally {
     currentDb = null;
   }
+}
+
+/**
+ * One full worker tick (what the cron endpoint and the worker loop run):
+ * process a bounded batch AND immediately continue with the jobs that batch
+ * enqueued (same-cycle), so a fresh customer message is answered in the same
+ * tick instead of waiting a full poll interval.
+ *
+ * No extra DB pre-scan: the batch runner already passes each job's own
+ * workspaceId to its handler, so a separate id→workspace map only added a
+ * redundant query and a stale-snapshot failure mode.
+ */
+export async function runWorkerTick(
+  db: HandlerDb,
+  opts?: { limit?: number; workerId?: string; maintenance?: boolean }
+) {
+  return runJobs(db, {
+    limit: opts?.limit ?? 10,
+    workerId: opts?.workerId,
+    maintenance: opts?.maintenance,
+    sameCycle: true,
+  });
 }

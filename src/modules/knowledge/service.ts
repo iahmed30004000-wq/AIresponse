@@ -7,6 +7,12 @@ import type { ActorContext, Db, Paginated } from "@/modules/customers/service";
 
 // ── Documents ───────────────────────────────────────────────────────────────
 
+async function assertProductInWorkspace(db: Db, workspaceId: string, productId?: string | null) {
+  if (!productId) return;
+  const product = await db.product.findFirst({ where: { id: productId, workspaceId }, select: { id: true } });
+  if (!product) throw new NotFoundError("Product");
+}
+
 export async function createKnowledgeDocument(
   db: Db,
   ctx: ActorContext,
@@ -16,11 +22,14 @@ export async function createKnowledgeDocument(
     category?: KnowledgeCategory;
     sourceType?: string;
     sourceUrl?: string | null;
+    productId?: string | null;
   }
 ) {
+  await assertProductInWorkspace(db, ctx.workspaceId, input.productId);
   const doc = await db.knowledgeDocument.create({
     data: {
       workspaceId: ctx.workspaceId,
+      productId: input.productId ?? null,
       title: input.title,
       content: input.content,
       category: input.category ?? "CUSTOM",
@@ -89,9 +98,10 @@ export async function updateDocument(
   db: Db,
   ctx: ActorContext,
   documentId: string,
-  data: { title?: string; content?: string; category?: KnowledgeCategory; isActive?: boolean }
+  data: { title?: string; content?: string; category?: KnowledgeCategory; isActive?: boolean; productId?: string | null }
 ) {
   const doc = await getOwnedDocument(db, ctx.workspaceId, documentId);
+  await assertProductInWorkspace(db, ctx.workspaceId, data.productId);
 
   const contentChanged = data.content !== undefined && data.content !== doc.content;
   const updated = await db.knowledgeDocument.update({
@@ -99,6 +109,7 @@ export async function updateDocument(
     data: {
       ...(data.title !== undefined ? { title: data.title } : {}),
       ...(data.category !== undefined ? { category: data.category } : {}),
+      ...(data.productId !== undefined ? { productId: data.productId } : {}),
       ...(data.isActive !== undefined ? { isActive: data.isActive } : {}),
       ...(contentChanged
         ? {
@@ -324,7 +335,17 @@ export async function updateFaq(
 /** FAQ retrieval: direct structured lookup — no vector search needed. */
 export async function findMatchingFaqs(
   db: Db,
-  params: { workspaceId: string; query: string; productId?: string; limit?: number }
+  params: {
+    workspaceId: string;
+    query: string;
+    productId?: string;
+    limit?: number;
+    /**
+     * P18 — حدود كتالوج الصفحة. عند تمريرها (حتى []) ما بترجع إلا أسئلة
+     * عامة (productId = null) أو أسئلة منتج داخل الكتالوج. undefined = بلا تقييد.
+     */
+    allowedProductIds?: string[] | null;
+  }
 ) {
   const words = params.query.split(/\s+/).filter((w) => w.length > 2).slice(0, 6);
   if (words.length === 0) return [];
@@ -332,12 +353,16 @@ export async function findMatchingFaqs(
     ...words.map((w) => ({ question: { contains: w, mode: "insensitive" as const } })),
     ...words.map((w) => ({ answer: { contains: w, mode: "insensitive" as const } })),
   ];
+  const allowedFilter: Prisma.FaqWhereInput | null = params.allowedProductIds
+    ? { OR: [{ productId: null }, { productId: { in: params.allowedProductIds } }] }
+    : null;
   const where: Prisma.FaqWhereInput = {
     workspaceId: params.workspaceId,
     isActive: true,
     AND: [
       { OR: wordMatches },
       ...(params.productId ? [{ productId: params.productId }] : []),
+      ...(allowedFilter ? [allowedFilter] : []),
     ],
   };
   return db.faq.findMany({ where, take: params.limit ?? 3 });

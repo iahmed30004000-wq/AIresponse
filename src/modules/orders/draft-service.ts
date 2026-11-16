@@ -1,19 +1,31 @@
-import type { Prisma, OrderDraftState } from "@prisma/client";
+import type { Prisma, OrderDraft, OrderDraftState } from "@prisma/client";
 import { AppError, NotFoundError } from "@/core/errors";
 import { makeEvent, eventBus } from "@/core/events/bus";
 import { recordAudit } from "@/modules/audit/service";
 import type { ActorContext, Db } from "@/modules/customers/service";
 import { assertDraftTransition } from "./state-machine";
-import { normalizePhone } from "./primitives";
+import { inferProvince, normalizePhone } from "./primitives";
 import { resolveProduct, type ResolvableProduct } from "./primitives";
+import {
+  DEFAULT_ORDER_FIELDS,
+  normalizeOrderFields,
+  type OrderFieldKey,
+} from "./required-fields";
 
 export const REQUIRED_DRAFT_FIELDS = ["product", "quantity", "phone", "address"] as const;
-export type RequiredDraftField = (typeof REQUIRED_DRAFT_FIELDS)[number];
+export type RequiredDraftField = OrderFieldKey;
 
 export interface DraftExtractionInput {
   productName?: string | null;
   productId?: string | null;
   quantity?: number | null;
+  /** P22 — عدة منتجات في رسالة واحدة (سلة). */
+  items?: {
+    productName?: string | null;
+    productId?: string | null;
+    quantity?: number | null;
+    variantId?: string | null;
+  }[];
   customerName?: string | null;
   phone?: string | null;
   rawAddress?: string | null;
@@ -22,16 +34,192 @@ export interface DraftExtractionInput {
   confidence?: Record<string, number>;
 }
 
-export async function getOrCreateDraft(db: Db, workspaceId: string, conversationId: string, customerId: string) {
-  let draft = await db.orderDraft.findUnique({ where: { conversationId } });
-  if (!draft) {
-    draft = await db.orderDraft.create({
-      data: { workspaceId, conversationId, customerId, state: "COLLECTING" },
-    });
-    await eventBus.publish(makeEvent("OrderDraftCreated", workspaceId, { draftId: draft.id, conversationId }));
-  }
-  return draft;
+/** عنصر سلة داخل مسودة الطلب (يُخزَّن JSON في OrderDraft.items). */
+export interface DraftItem {
+  productId: string | null;
+  productName: string;
+  variantId: string | null;
+  quantity: number | null;
 }
+
+/**
+ * P22 — يقرأ سلة المسودة. توافق خلفي: المسودات القديمة (بلا items) ترجع
+ * منتجها المفرد. اسم المنتج قد يكون فارغًا بالمسودات القديمة (productId فقط) —
+ * مسار إنشاء الطلب يجيب الاسم من قاعدة البيانات.
+ */
+export function parseDraftItems(draft: {
+  items?: unknown;
+  productId?: string | null;
+  productName?: string | null;
+  variantId?: string | null;
+  quantity?: number | null;
+}): DraftItem[] {
+  let raw: unknown = draft.items;
+  if (typeof raw === "string") {
+    try {
+      raw = JSON.parse(raw);
+    } catch {
+      raw = [];
+    }
+  }
+  const items: DraftItem[] = [];
+  if (Array.isArray(raw)) {
+    for (const entry of raw) {
+      if (!entry || typeof entry !== "object") continue;
+      const o = entry as Record<string, unknown>;
+      const productId = typeof o.productId === "string" && o.productId ? o.productId : null;
+      const name = typeof o.productName === "string" ? o.productName.trim() : "";
+      if (!productId && !name) continue;
+      const q = typeof o.quantity === "number" && Number.isFinite(o.quantity) ? Math.trunc(o.quantity) : null;
+      items.push({
+        productId,
+        productName: name,
+        variantId: typeof o.variantId === "string" && o.variantId ? o.variantId : null,
+        quantity: q && q > 0 ? q : null,
+      });
+      if (items.length >= 20) break;
+    }
+  }
+  if (items.length === 0 && draft.productId) {
+    items.push({
+      productId: draft.productId,
+      productName: (draft.productName ?? "").trim(),
+      variantId: draft.variantId ?? null,
+      quantity: draft.quantity && draft.quantity > 0 ? draft.quantity : null,
+    });
+  }
+  return items;
+}
+
+/** حالات المسودة المفتوحة (قابلة للجمع/التأكيد). */
+export const OPEN_DRAFT_STATES: OrderDraftState[] = ["EMPTY", "COLLECTING", "READY", "CONFIRMING"];
+
+/** كل المسودات المفتوحة للمحادثة — الأحدث أولًا. */
+export async function listOpenDrafts(db: Db, workspaceId: string, conversationId: string) {
+  return (await db.orderDraft.findMany({
+    where: { workspaceId, conversationId, state: { in: OPEN_DRAFT_STATES } },
+    orderBy: { sequence: "desc" },
+  })) as OrderDraft[];
+}
+
+async function nextDraftSequence(db: Db, workspaceId: string, conversationId: string): Promise<number> {
+  const last = (await db.orderDraft.findFirst({
+    where: { workspaceId, conversationId },
+    orderBy: { sequence: "desc" },
+    select: { sequence: true },
+  })) as { sequence?: number } | null;
+  return (last?.sequence ?? 0) + 1;
+}
+
+/**
+ * مسودة جديدة (منتج واحد فقط) بترقيم تسلسلي داخل المحادثة.
+ * قرار المالك: كل منتج مسودة مستقلة — لا سلة.
+ */
+async function createDraftRow(db: Db, workspaceId: string, conversationId: string, customerId: string) {
+  const customer = await db.customer.findFirst({
+    where: { id: customerId, workspaceId },
+    select: { name: true, phone: true, address: true, province: true },
+  });
+  // قرار المالك — كل منتج مسودة جديدة، بس بيانات التواصل تُورَّث من آخر مسودة
+  // بنفس المحادثة (ما نطلب الاسم/الرقم/العنوان من جديد لكل منتج).
+  const previous = (await db.orderDraft.findFirst({
+    where: { workspaceId, conversationId },
+    orderBy: { sequence: "desc" },
+    select: { customerName: true, phone: true, rawAddress: true, province: true },
+  })) as { customerName: string | null; phone: string | null; rawAddress: string | null; province: string | null } | null;
+  const rawAddress = previous?.rawAddress ?? customer?.address ?? null;
+  const province = previous?.province ?? customer?.province ?? (rawAddress ? inferProvince(rawAddress) : null);
+  const previousPhone = previous?.phone ? normalizePhone(previous.phone) : null;
+  const profilePhone = customer?.phone ? normalizePhone(customer.phone) : null;
+  const seed = {
+    customerName: previous?.customerName ?? customer?.name ?? null,
+    phone: previousPhone?.valid ? previousPhone.canonical : profilePhone?.valid ? profilePhone.canonical : null,
+    rawAddress,
+    province,
+  };
+  const sequence = await nextDraftSequence(db, workspaceId, conversationId);
+  try {
+    const draft = await db.orderDraft.create({
+      data: {
+        workspaceId,
+        conversationId,
+        customerId,
+        sequence,
+        state: "COLLECTING",
+        ...seed,
+        items: [] as Prisma.InputJsonValue,
+        missingFields: computeMissingFields({
+          productId: null,
+          quantity: null,
+          phone: seed.phone,
+          rawAddress: seed.rawAddress,
+          province: seed.province,
+        }),
+      },
+    });
+    await eventBus.publish(makeEvent("OrderDraftCreated", workspaceId, { draftId: draft.id, conversationId, sequence }));
+    return draft as OrderDraft;
+  } catch (err) {
+    // سباق على نفس الرقم: نكمل على أحدث مسودة مفتوحة بدل ما نفشل الرد.
+    if ((err as { code?: string }).code !== "P2002") throw err;
+    const open = await listOpenDrafts(db, workspaceId, conversationId);
+    if (open[0]) return open[0];
+    throw err;
+  }
+}
+
+/** المسودة النشطة = أحدث مسودة مفتوحة، أو مسودة جديدة. */
+export async function getOrCreateDraft(db: Db, workspaceId: string, conversationId: string, customerId: string) {
+  const open = await listOpenDrafts(db, workspaceId, conversationId);
+  if (open[0]) return open[0];
+  return createDraftRow(db, workspaceId, conversationId, customerId);
+}
+
+/** عنصر واحد فقط داخل المسودة (مرآة الحقول المفردة للتوافق). */
+function singleItemData(
+  item: DraftItem,
+  quantityOverride?: number | null
+): Prisma.OrderDraftUncheckedUpdateInput {
+  const quantity = quantityOverride !== undefined ? quantityOverride : item.quantity;
+  const stored: DraftItem = { ...item, quantity };
+  return {
+    items: [stored] as unknown as Prisma.InputJsonValue,
+    productId: item.productId,
+    productName: item.productName || null,
+    variantId: item.variantId,
+    quantity,
+  };
+}
+
+/** يكمل بيانات العميل المعروفة على المسودة (بلا استبدال قيمة موجودة). */
+async function backfillCustomerFields(
+  db: Db,
+  workspaceId: string,
+  customerId: string,
+  draft: OrderDraft
+): Promise<OrderDraft> {
+  if (draft.phone && draft.rawAddress && draft.province && draft.customerName) return draft;
+  const customer = await db.customer.findFirst({
+    where: { id: customerId, workspaceId },
+    select: { name: true, phone: true, address: true, province: true },
+  });
+  if (!customer) return draft;
+  const backfill: Prisma.OrderDraftUncheckedUpdateInput = {};
+  if (!draft.phone && customer.phone) {
+    const normalized = normalizePhone(customer.phone);
+    if (normalized.valid && normalized.canonical) backfill.phone = normalized.canonical;
+  }
+  if (!draft.rawAddress && customer.address) backfill.rawAddress = customer.address;
+  if (!draft.province) {
+    const source = draft.rawAddress ?? customer.address ?? null;
+    const province = customer.province ?? (source ? inferProvince(source) : null);
+    if (province) backfill.province = province;
+  }
+  if (!draft.customerName && customer.name) backfill.customerName = customer.name;
+  if (Object.keys(backfill).length === 0) return draft;
+  return (await db.orderDraft.update({ where: { id: draft.id }, data: backfill })) as OrderDraft;
+}
+
 
 export async function getOwnedDraft(db: Db, workspaceId: string, draftId: string) {
   const draft = await db.orderDraft.findUnique({ where: { id: draftId } });
@@ -56,117 +244,279 @@ export async function updateDraftFromExtraction(
     allowedProductIds?: string[];
   }
 ) {
-  const draft = await getOrCreateDraft(db, params.workspaceId, params.conversationId, params.customerId);
-  if (draft.state === "CANCELLED" || draft.state === "CONVERTED") {
-    throw new AppError("Draft is closed", 422, "DRAFT_CLOSED");
+  let active = await getOrCreateDraft(db, params.workspaceId, params.conversationId, params.customerId);
+
+  // Legacy: مسودة قديمة انبنت كسلة (>1 منتج). نفصلها لمسودة لكل منتج.
+  const legacyItems = parseDraftItems(active);
+  if (legacyItems.length > 1) {
+    const [first, ...rest] = legacyItems;
+    await db.orderDraft.update({ where: { id: active.id }, data: singleItemData(first) });
+    for (const item of rest) {
+      const created = await createDraftRow(db, params.workspaceId, params.conversationId, params.customerId);
+      await db.orderDraft.update({ where: { id: created.id }, data: singleItemData(item) });
+    }
+    active = (await db.orderDraft.findUniqueOrThrow({ where: { id: active.id } })) as OrderDraft;
   }
 
-  const data: Prisma.OrderDraftUncheckedUpdateInput = {};
+  // P22 — منتجات مذكورة بالرسالة (مفرد أو متعدد). كل واحد بمسودته.
+  const rawItems =
+    Array.isArray(params.extraction.items) && params.extraction.items.length > 0
+      ? params.extraction.items
+      : params.extraction.productName || params.extraction.productId
+        ? [
+            {
+              productName: params.extraction.productName,
+              productId: params.extraction.productId,
+              quantity: params.extraction.quantity,
+              variantId: null as string | null,
+            },
+          ]
+        : [];
 
-  // Product resolution (deterministic, DB-backed).
-  let resolvedProductId = draft.productId;
-  if (params.extraction.productName || params.extraction.productId) {
-    if (params.extraction.productId) {
-      // Page-catalog gate (same allowlist the reply path uses): an id
-      // outside the catalog is treated as never sighted, not an error.
-      const allow = params.allowedProductIds;
-      if (!allow || allow.includes(params.extraction.productId)) {
-        resolvedProductId = params.extraction.productId;
+  const incoming: DraftItem[] = [];
+  if (rawItems.length > 0) {
+    // اسم المنتج يُحلّ من قاعدة البيانات (لا ثقة بنص الموديل)، ومعرّف المنتج
+    // يُتحقق من المساحة/النشاط/الكتالوج. كل شيء خارجها = كأنه ما انذكر.
+    const allowed = params.allowedProductIds;
+    const needsName = rawItems.some((i) => !i.productId && i.productName);
+    const catalogProducts = needsName
+      ? ((await db.product.findMany({
+          where: {
+            workspaceId: params.workspaceId,
+            isActive: true,
+            isArchived: false,
+            ...(allowed ? { id: { in: allowed } } : {}),
+          },
+        })) as unknown as ResolvableProduct[])
+      : [];
+    const withAliases = catalogProducts.map((p) => ({
+      ...p,
+      aliases: [p.name, ...(((p as unknown as { tags?: string[] }).tags ?? []).filter((t) => t.length > 2))],
+    }));
+    const idList = [...new Set(rawItems.map((i) => i.productId).filter((v): v is string => Boolean(v)))];
+    const ownedById = new Map(
+      (idList.length
+        ? await db.product.findMany({
+            where: {
+              id: { in: idList },
+              workspaceId: params.workspaceId,
+              isActive: true,
+              isArchived: false,
+              ...(allowed ? { id: { in: allowed } } : {}),
+            },
+            select: { id: true, name: true },
+          })
+        : []
+      ).map((p) => [p.id, p] as const)
+    );
+
+    for (const raw of rawItems) {
+      let productId: string | null = null;
+      let productName = "";
+      if (raw.productId) {
+        const owned = ownedById.get(raw.productId);
+        if (!owned) continue;
+        productId = owned.id;
+        productName = owned.name;
+      } else if (raw.productName) {
+        const resolution = resolveProduct(raw.productName, withAliases);
+        if (resolution.status === "AMBIGUOUS") {
+          await eventBus.publish(makeEvent("OrderDraftUpdated", params.workspaceId, { draftId: active.id, ambiguous: true }));
+          return { draft: active, ambiguousCandidates: resolution.candidates!.map((c) => c.name) };
+        }
+        if (resolution.status !== "RESOLVED") continue; // NOT_FOUND: لا نضيف منتجًا وهميًا
+        productId = resolution.product!.id;
+        productName = resolution.product!.name;
+      } else {
+        continue;
       }
-    } else {
-      const products = (await db.product.findMany({
-        where: {
-          workspaceId: params.workspaceId, isActive: true, isArchived: false,
-          // The catalog allowlist scopes ORDER INTAKE the same way it
-          // scopes the reply: a page may only order what its catalog holds.
-          ...(params.allowedProductIds ? { id: { in: params.allowedProductIds } } : {}),
-        },
-      })) as unknown as ResolvableProduct[];
-      const withAliases = products.map((p) => ({
-        ...p,
-        aliases: [p.name, ...(((p as unknown as { tags?: string[] }).tags ?? []).filter((t) => t.length > 2))],
-      }));
-      const resolution = resolveProduct(params.extraction.productName!, withAliases);
-      if (resolution.status === "RESOLVED") resolvedProductId = resolution.product!.id;
-      else if (resolution.status === "AMBIGUOUS") {
-        // Ambiguity → ask, never guess.
-        await eventBus.publish(makeEvent("OrderDraftUpdated", params.workspaceId, { draftId: draft.id, ambiguous: true }));
-        return { draft, ambiguousCandidates: resolution.candidates!.map((c) => c.name) };
-      }
-      // NOT_FOUND keeps the previous product (contextual continuation).
+      const quantity = raw.quantity && raw.quantity > 0 ? Math.trunc(raw.quantity) : null;
+      incoming.push({ productId, productName, variantId: raw.variantId ?? null, quantity });
     }
   }
-  if (resolvedProductId && resolvedProductId !== draft.productId) data.productId = resolvedProductId;
 
-  if (params.extraction.quantity && params.extraction.quantity > 0) {
-    data.quantity = params.extraction.quantity;
+  // كل منتج → مسودته: نفس المنتج يحدّث مسودته المفتوحة، ومنتج جديد = مسودة جديدة.
+  // لقطة المسودات المفتوحة قبل التعديل: لو مسودة جاهزة/قيد التأكيد تغيّر فيها شي جوهري
+  // بنرجّعها لجمع البيانات ونطلب تأكيد جديد (العميل شاف ملخصاً قديماً).
+  const beforeById = new Map(
+    (await listOpenDrafts(db, params.workspaceId, params.conversationId)).map((d) => [d.id, d] as const)
+  );
+  const targets: OrderDraft[] = [];
+  if (incoming.length > 0) {
+    for (const item of incoming) {
+      const open = await listOpenDrafts(db, params.workspaceId, params.conversationId);
+      const match = open.find((d) => parseDraftItems(d)[0]?.productId === item.productId);
+      if (match) {
+        const current = parseDraftItems(match)[0];
+        const quantity = item.quantity ?? current?.quantity ?? null;
+        targets.push(
+          (await db.orderDraft.update({
+            where: { id: match.id },
+            data: singleItemData({ ...item, quantity }, quantity),
+          })) as OrderDraft
+        );
+      } else {
+        // أول منتج يستخدم المسودة النشطة الفارغة (ما نترك مسودة فارغة يتيمة).
+        const empty = open.find(
+          (d) => parseDraftItems(d).length === 0 && d.state !== "READY" && d.state !== "CONFIRMING"
+        );
+        const created = empty ?? (await createDraftRow(db, params.workspaceId, params.conversationId, params.customerId));
+        targets.push(
+          (await db.orderDraft.update({ where: { id: created.id }, data: singleItemData(item) })) as OrderDraft
+        );
+      }
+    }
+  } else if (params.extraction.quantity && params.extraction.quantity > 0 && parseDraftItems(active).length > 0) {
+    // كمية بلا اسم منتج («بدي 3») = تحديث آخر مسودة مفتوحة.
+    const current = parseDraftItems(active)[0];
+    const quantity = Math.trunc(params.extraction.quantity);
+    targets.push(
+      (await db.orderDraft.update({
+        where: { id: active.id },
+        data: singleItemData({ ...current, quantity }, quantity),
+      })) as OrderDraft
+    );
+  } else {
+    targets.push(active);
   }
-  if (params.extraction.customerName && !draft.customerName) data.customerName = params.extraction.customerName;
-  if (params.extraction.notes) data.notes = params.extraction.notes;
 
+  // بيانات التواصل/الملاحظات تُطبَّق على كل مسودة تأثّرت بهذه الرسالة.
+  const common: Prisma.OrderDraftUncheckedUpdateInput = {};
+  if (params.extraction.customerName) common.customerName = params.extraction.customerName;
+  if (params.extraction.notes) common.notes = params.extraction.notes;
   if (params.extraction.phone) {
     const phone = normalizePhone(params.extraction.phone);
-    if (phone.valid) data.phone = phone.canonical;
+    if (phone.valid) common.phone = phone.canonical;
   }
   if (params.extraction.rawAddress) {
-    data.rawAddress = params.extraction.rawAddress;
-  }
-  if (params.extraction.province) {
-    data.province = params.extraction.province;
-  } else if (params.extraction.rawAddress) {
-    // Deterministic known-province mapping from the raw address (spec §8).
-    const { inferProvince } = await import("./primitives");
-    const inferred = inferProvince(params.extraction.rawAddress);
-    if (inferred) data.province = inferred;
+    common.rawAddress = params.extraction.rawAddress;
+    common.province = params.extraction.province ?? inferProvince(params.extraction.rawAddress) ?? null;
+  } else if (params.extraction.province) {
+    common.province = params.extraction.province;
   }
   if (params.extraction.confidence) {
-    data.entityConfidence = params.extraction.confidence as Prisma.InputJsonValue;
+    common.entityConfidence = params.extraction.confidence as Prisma.InputJsonValue;
   }
 
-  const updated = await db.orderDraft.update({ where: { id: draft.id }, data });
+  const requiredFields = await getRequiredOrderFields(db, params.workspaceId, params.conversationId);
+  const results: { id: string; missingFields: RequiredDraftField[]; becameReady: boolean }[] = [];
+  let primary: OrderDraft = targets[targets.length - 1];
+  let becameReady = false;
 
-  // Deterministic missing-field computation.
-  const refreshed = await db.orderDraft.findUniqueOrThrow({ where: { id: draft.id } }) as typeof draft;
-  const missing = computeMissingFields(refreshed);
-  const final = await db.orderDraft.update({
-    where: { id: draft.id },
-    data: { missingFields: missing },
-  });
+  for (const target of targets) {
+    let current = Object.keys(common).length > 0
+      ? ((await db.orderDraft.update({ where: { id: target.id }, data: common })) as OrderDraft)
+      : target;
+    current = await backfillCustomerFields(db, params.workspaceId, params.customerId, current);
+    const prev = beforeById.get(current.id);
+    if (prev && (prev.state === "READY" || prev.state === "CONFIRMING") && draftMaterialChange(prev, current)) {
+      assertDraftTransition(current.state as OrderDraftState, "COLLECTING");
+      current = (await db.orderDraft.update({ where: { id: current.id }, data: { state: "COLLECTING" } })) as OrderDraft;
+    }
 
-  await recordAudit(db, {
-    workspaceId: params.workspaceId,
-    action: "order_draft.updated",
-    entityType: "OrderDraft",
-    entityId: draft.id,
-    metadata: { source: params.source, missing },
-  });
-  await eventBus.publish(makeEvent("OrderDraftUpdated", params.workspaceId, { draftId: draft.id, missing }));
+    const missing = computeMissingFields(current, requiredFields);
+    current = (await db.orderDraft.update({
+      where: { id: current.id },
+      data: { missingFields: missing },
+    })) as OrderDraft;
 
-  // State transition to READY when nothing is missing.
-  if (missing.length === 0 && final.state === "COLLECTING") {
-    assertDraftTransition(final.state, "READY");
-    const ready = await db.orderDraft.update({ where: { id: draft.id }, data: { state: "READY" } });
-    await eventBus.publish(makeEvent("OrderReadyForConfirmation", params.workspaceId, { draftId: draft.id }));
-    return { draft: ready, missingFields: missing, becameReady: true };
+    let ready = false;
+    if (missing.length === 0 && current.state === "COLLECTING") {
+      assertDraftTransition(current.state as OrderDraftState, "READY");
+      current = (await db.orderDraft.update({
+        where: { id: current.id },
+        data: { state: "READY" },
+      })) as OrderDraft;
+      // المسودة الجاهزة ما بتنرحّل لتلجرام — الترحيل للطلبات فقط.
+      await eventBus.publish(makeEvent("OrderReadyForConfirmation", params.workspaceId, { draftId: current.id }));
+      ready = true;
+      becameReady = true;
+    }
+
+    await recordAudit(db, {
+      workspaceId: params.workspaceId,
+      action: "order_draft.updated",
+      entityType: "OrderDraft",
+      entityId: current.id,
+      metadata: { source: params.source, missing },
+    });
+    await eventBus.publish(makeEvent("OrderDraftUpdated", params.workspaceId, { draftId: current.id, missing }));
+
+    results.push({ id: current.id, missingFields: missing, becameReady: ready });
+    primary = current;
   }
 
-  return { draft: final, missingFields: missing };
+  return {
+    draft: primary,
+    missingFields: results[results.length - 1]?.missingFields ?? (primary.missingFields as RequiredDraftField[]),
+    ...(becameReady ? { becameReady: true } : {}),
+    drafts: results,
+  };
 }
 
-export function computeMissingFields(draft: {
-  productId: string | null;
-  quantity: number | null;
-  phone: string | null;
-  rawAddress: string | null;
-  province: string | null;
-}): RequiredDraftField[] {
+export function computeMissingFields(
+  draft: {
+    items?: unknown;
+    productId: string | null;
+    quantity: number | null;
+    customerName?: string | null;
+    phone: string | null;
+    rawAddress: string | null;
+    province: string | null;
+  },
+  requiredFields: readonly string[] = DEFAULT_ORDER_FIELDS
+): RequiredDraftField[] {
+  const required = new Set(requiredFields);
   const missing: RequiredDraftField[] = [];
-  if (!draft.productId) missing.push("product");
-  if (!draft.quantity || draft.quantity <= 0) missing.push("quantity");
-  if (!draft.phone) missing.push("phone");
-  if (!draft.rawAddress && !draft.province) missing.push("address");
+  // P22 — الحساب على السلة: منتج/كمية لكل عنصر. مسودة فارغة = الاثنان ناقصان.
+  const items = parseDraftItems(draft);
+  if (items.length === 0) {
+    missing.push("product", "quantity");
+  } else {
+    if (items.some((i) => !i.productId)) missing.push("product");
+    if (items.some((i) => !i.quantity || i.quantity <= 0)) missing.push("quantity");
+  }
+  if (required.has("phone") && !draft.phone) missing.push("phone");
+  if (required.has("address") && !draft.rawAddress && !draft.province) missing.push("address");
+  if (required.has("name") && !draft.customerName) missing.push("name");
   return missing;
 }
+
+/** مرآة العنصر الأول للحقول المفردة (توافق خلفي/بطاقة/ملخص). */
+function applyCartToDraftData(data: Prisma.OrderDraftUncheckedUpdateInput, items: DraftItem[]): void {
+  data.items = items as unknown as Prisma.InputJsonValue;
+  const first = items[0] ?? null;
+  data.productId = first?.productId ?? null;
+  data.productName = first?.productName || null;
+  data.variantId = first?.variantId ?? null;
+  data.quantity = first?.quantity ?? null;
+}
+
+/** الحقول المطلوبة لهذه المحادثة حسب صفحتها؛ غياب القناة = الافتراضي. */
+export async function getRequiredOrderFields(
+  db: Db,
+  workspaceId: string,
+  conversationId: string
+): Promise<OrderFieldKey[]> {
+  const conversation = await db.conversation.findUnique({
+    where: { id: conversationId },
+    select: { workspaceId: true, channelId: true },
+  });
+  if (!conversation || conversation.workspaceId !== workspaceId || !conversation.channelId) {
+    return [...DEFAULT_ORDER_FIELDS];
+  }
+  const channel = await db.channel.findUnique({
+    where: { id: conversation.channelId },
+    select: { workspaceId: true, orderRequiredFields: true },
+  });
+  if (!channel || channel.workspaceId !== workspaceId) return [...DEFAULT_ORDER_FIELDS];
+  return normalizeOrderFields((channel as { orderRequiredFields?: string[] }).orderRequiredFields);
+}
+
+/**
+ * ملاحظة سلوكية (قرار المالك): المسودة الجاهزة **ما بتنرحّل** لتلجرام.
+ * الترحيل يصير مرة واحدة عند إنشاء الطلب الرسمي (order-service).
+ */
 
 /**
  * MULTI-ORDER PER CONVERSATION — MANY orders per conversation.
@@ -197,6 +547,7 @@ export async function recycleDraftForNewOrder(db: Db, workspaceId: string, draft
       variantId: null,
       quantity: null,
       notes: null,
+      items: [] as Prisma.InputJsonValue,
       missingFields: ["product", "quantity"],
       entityConfidence: {},
       idempotencyKey,
@@ -241,18 +592,86 @@ export async function cancelDraft(db: Db, ctx: ActorContext, draftId: string) {
   return draft;
 }
 
+/**
+ * مسودات مفتوحة فيها منتج طلع من كتالوج الصفحة: المنتج بيتشال وبيانات التواصل
+ * بتضل، والمسودة بترجع لجمع البيانات — فما بتتأكد ولا بتظهر بملخص أو سؤال.
+ * يرجّع عدد المسودات اللي تعدّلت.
+ */
+export async function retireOutOfCatalogDraftItems(
+  db: Db,
+  params: { workspaceId: string; conversationId: string; allowedProductIds: string[] }
+): Promise<number> {
+  const open = await listOpenDrafts(db, params.workspaceId, params.conversationId);
+  const allowed = new Set(params.allowedProductIds);
+  let retired = 0;
+  for (const draft of open) {
+    const items = parseDraftItems(draft);
+    const kept = items.filter((item) => item.productId && allowed.has(item.productId));
+    const orphanName = items.length === 0 && Boolean(draft.productName);
+    if (kept.length === items.length && !orphanName) continue;
+
+    const requiredFields = await getRequiredOrderFields(db, params.workspaceId, params.conversationId);
+    const data: Prisma.OrderDraftUncheckedUpdateInput = {};
+    applyCartToDraftData(data, kept);
+    data.missingFields = computeMissingFields(
+      { items: kept, productId: kept[0]?.productId ?? null, quantity: kept[0]?.quantity ?? null, customerName: draft.customerName, phone: draft.phone, rawAddress: draft.rawAddress, province: draft.province },
+      requiredFields
+    );
+    if (draft.state === "READY" || draft.state === "CONFIRMING") {
+      assertDraftTransition(draft.state as OrderDraftState, "COLLECTING");
+      data.state = "COLLECTING";
+    }
+    await db.orderDraft.update({ where: { id: draft.id }, data });
+    await recordAudit(db, {
+      workspaceId: params.workspaceId,
+      action: "order_draft.updated",
+      entityType: "OrderDraft",
+      entityId: draft.id,
+      metadata: { source: "CATALOG_BOUNDARY", removedProductIds: items.filter((i) => !kept.includes(i)).map((i) => i.productId) },
+    });
+    await eventBus.publish(makeEvent("OrderDraftUpdated", params.workspaceId, { draftId: draft.id, catalogBoundary: true }));
+    retired += 1;
+  }
+  return retired;
+}
+
 /** Deterministic order summary text for the AI to phrase (never prices from AI). */
+/**
+ * نفس الملخص بلا قيم التواصل — هاد اللي بيروح للموديل.
+ *
+ * ⚠️ ملخص المسودة فيه رقم الزبون وعنوانه، وكان بينحط حرفيًا بسياق الموديل.
+ * الموديل ما بيحتاجه أبدًا ليكتب الرد — بيحتاج يعرف إنه موجود مش ناقص.
+ * 🔧 القيمة بتنشال ويضل الإشعار. وبما إنه الموديل ما شافها، ما بيقدر يطلّعها.
+ */
+export function redactSummaryContacts(summary: string): string {
+  return summary
+    .replace(/^(الهاتف|الاسم):.*$/gmu, "$1: محفوظ ✅")
+    .replace(/^العنوان:.*$/gmu, "العنوان: محفوظ ✅");
+}
+
 export function buildDraftSummary(draft: {
+  items?: unknown;
+  productId?: string | null;
   productName?: string | null;
   quantity: number | null;
+  variantId?: string | null;
   phone: string | null;
   rawAddress: string | null;
   province: string | null;
   missingFields: string[];
 }): string {
   const lines: string[] = [];
-  if (draft.productName) lines.push(`المنتج: ${draft.productName}`);
-  if (draft.quantity) lines.push(`الكمية: ${draft.quantity}`);
+  const items = parseDraftItems(draft);
+  if (items.length > 0) {
+    lines.push("المنتجات:");
+    for (const item of items) {
+      const qty = item.quantity ? ` × ${item.quantity}` : "";
+      lines.push(`- ${item.productName || "منتج"}${qty}`);
+    }
+  } else if (draft.productName) {
+    lines.push(`المنتج: ${draft.productName}`);
+    if (draft.quantity) lines.push(`الكمية: ${draft.quantity}`);
+  }
   if (draft.phone) lines.push(`الهاتف: ${draft.phone}`);
   if (draft.rawAddress || draft.province) {
     lines.push(`العنوان: ${[draft.province, draft.rawAddress].filter(Boolean).join(" - ")}`);
@@ -272,4 +691,14 @@ function fieldLabel(f: string): string {
     case "name": return "الاسم";
     default: return f;
   }
+}
+
+/** تغيير جوهري بمسودة جاهزة: منتج · كمية · رقم هاتف · عنوان — يستوجب تأكيداً جديداً. */
+function draftMaterialChange(prev: OrderDraft, next: OrderDraft): boolean {
+  const itemsKey = (d: OrderDraft) => JSON.stringify(parseDraftItems(d).map((i) => [i.productId, i.quantity]));
+  return (
+    itemsKey(prev) !== itemsKey(next) ||
+    (prev.phone ?? null) !== (next.phone ?? null) ||
+    (prev.rawAddress ?? null) !== (next.rawAddress ?? null)
+  );
 }

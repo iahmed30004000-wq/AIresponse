@@ -383,10 +383,14 @@ describe("orphan sweeper (never silent)", () => {
     fbSuccess();
     mockAI();
     const r = await seedInbound("psid-ws-ctx", "شو المواصفات؟", ch.id, "wsctx");
-    // Simulate the enqueue loss: drop the auto-created job → the message is a
-    // sweeper orphan with NO job row.
-    const autoJob = aiJobs()[0];
-    await db.backgroundJob.delete({ where: { id: autoJob.id } } as never);
+    // Simulate the enqueue loss: drop ALL auto-created jobs for this message
+    // (reply + customer-intel) → the message is a sweeper orphan with NO job.
+    const autoJobs = (db._stores.backgroundJob as any[]).filter(
+      (j) => (j.payload as any)?.messageId === r.messageId
+    );
+    for (const j of autoJobs) {
+      await db.backgroundJob.delete({ where: { id: j.id } } as never);
+    }
     // One worker cycle = recovery sweep (creates the job NOW) + processing.
     // Before the fix, the freshly-created job was not in the pre-claimed
     // workspace snapshot → handler received workspaceId="" → gating returned
@@ -499,6 +503,36 @@ describe("retry idempotency, burst, ordering", () => {
       return Number((reply?.text ?? "").match(/رد رقم (\d+)/)?.[1] ?? 0);
     });
     expect(replyNumbers).toEqual([1, 2, 3, 4, 5, 6, 7, 8, 9, 10]);
+  });
+
+  it("16b. burst inside one millisecond: created-order drain is never falsely deferred", async () => {
+    // A fast machine stores several inbound rows in the same millisecond, so
+    // the ordering guard falls back to comparing ids. Row 10 must not sort
+    // before row 9 there, or draining in arrival order defers a message.
+    const ch = await seedPage();
+    fbSuccess();
+    mockAI({});
+    const conv = await seedInbound("psid-d6b", "رسالة 0", ch.id, "tie0");
+    for (let i = 1; i < 12; i++) {
+      await processIncomingMessage(db as Db, {
+        workspaceId: WS_A, channelType: "FACEBOOK", channelId: ch.id,
+        externalUserId: "psid-d6b", externalConversationId: "psid-d6b",
+        externalMessageId: `m-tie-${i}`, externalEventId: `e-tie-${i}`,
+        provider: "facebook", type: "TEXT", text: `رسالة ${i}`,
+      });
+    }
+    const sameInstant = new Date("2026-01-01T00:00:00Z");
+    const inbound = (db._stores.message as any[]).filter((m) => m.conversationId === conv.conversationId);
+    for (const m of inbound) m.createdAt = sameInstant;
+
+    const statuses: string[] = [];
+    for (const row of inbound) {
+      const res = await processAIMessage(
+        db as Db, { conversationId: conv.conversationId, messageId: row.id, workspaceId: WS_A }, { vectorStore: stubVector }
+      );
+      statuses.push(res.status);
+    }
+    expect(statuses.filter((status) => status === "DEFERRED")).toEqual([]);
   });
 
   it("13. QUEUED outbound eventually reaches SENT via recovery (no silent stall)", async () => {
