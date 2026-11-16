@@ -1,0 +1,475 @@
+<!DOCTYPE html>
+<html lang="ar" dir="rtl">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Zaki response الشكل المقترح</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Sans+Arabic:wght@400;500;600;700&display=swap" rel="stylesheet">
+<style>
+:root{
+  /* الفكرة: هيكل تطبيق حقيقي بهوية Zaki (نفس الـ OMS): شريط جانبي كحلي، محتوى فاتح هادئ،
+     لون أساسي واحد (تركوازي غامق) للفعل الأساسي فقط، وألوان الحالة منفصلة عنه. */
+  --bg:#FFFFFF; --card:#F4F8FA; --surface:#E9F0F3; --surface-strong:#DCE7EC;
+  --line:#D5E1E6; --line-strong:#A9BAC5;
+  --text:#0C3252; --muted:#4A6272; --subtle:#5F6C75;
+  --primary:#1A6382; --primary-hover:#176079; --on-primary:#FFFFFF; --primary-soft:#E9F1F4;
+  --success:#1E7A3A; --success-soft:#E6F2EA;
+  --warning:#9A5B12; --warning-soft:#F7F0E4;
+  --danger:#B42318; --danger-soft:#F7ECEA;
+  --sidebar:#0A1A2E; --sidebar-fg:#9FB6C2; --sidebar-on:#E6F1F4; --sidebar-active:#16304A; --sidebar-line:#1C3A52;
+  --font:"IBM Plex Sans Arabic","Segoe UI",Tahoma,sans-serif;
+  --r-control:6px; --r-card:10px; --r-sheet:16px;
+  --raised:0 1px 2px rgb(12 50 82 / .06),0 1px 3px rgb(12 50 82 / .08);
+  --overlay:0 2px 6px rgb(12 50 82 / .07),0 12px 32px rgb(12 50 82 / .16);
+  --ease:cubic-bezier(.2,0,.1,1);
+  color-scheme:light;
+}
+.app[data-mode="dark"]{
+  --bg:#050F1F; --card:#0A1A2E; --surface:#0F2438; --surface-strong:#16304A;
+  --line:#1C3A52; --line-strong:#486276;
+  --text:#E6F1F4; --muted:#9FB6C2; --subtle:#8CA0AD;
+  --primary:#36B5CC; --primary-hover:#60DADB; --on-primary:#04182B; --primary-soft:#0E2A3E;
+  --success:#4FB865; --success-soft:#112A34;
+  --warning:#E8973A; --warning-soft:#2A2618;
+  --danger:#E65E52; --danger-soft:#2A1A22;
+  --sidebar:#071426; --sidebar-active:#16304A;
+  --raised:0 1px 2px rgb(0 0 0 / .55);
+  --overlay:0 2px 8px rgb(0 0 0 / .45),0 16px 40px rgb(0 0 0 / .65);
+  color-scheme:dark;
+}
+*{box-sizing:border-box}
+html,body{height:100%;margin:0}
+body{background:#FFFFFF;font-family:var(--font);font-size:14px;line-height:1.65;color:#0C3252}
+button{font:inherit;color:inherit;cursor:pointer}
+button:focus-visible,a:focus-visible,input:focus-visible,summary:focus-visible{outline:2px solid var(--primary);outline-offset:2px}
+.num{font-variant-numeric:tabular-nums;direction:ltr;unicode-bidi:isolate}
+svg{flex:none}
+
+/* ── الهيكل ── */
+.app{display:flex;height:100%;background:var(--bg);color:var(--text)}
+.side{width:232px;background:var(--sidebar);color:var(--sidebar-fg);display:flex;flex-direction:column;flex:none}
+.brand{display:flex;align-items:center;gap:10px;padding:18px 16px 14px;color:var(--sidebar-on)}
+.brand b{font-size:16px;font-weight:600}
+.brand small{display:block;font-size:12px;color:var(--sidebar-fg)}
+.logo{width:34px;height:34px;border-radius:9px;background:linear-gradient(135deg,#36B5CC,#1A6382);display:grid;place-items:center;color:#fff;font-weight:700}
+.nav{display:flex;flex-direction:column;gap:2px;padding:8px}
+.nav a{display:flex;align-items:center;gap:10px;height:42px;padding:0 12px;border-radius:8px;color:var(--sidebar-fg);text-decoration:none;font-weight:500;position:relative;transition:background .15s var(--ease)}
+.nav a:hover{background:rgb(255 255 255 / .05);color:var(--sidebar-on)}
+.nav a[aria-current="page"]{background:var(--sidebar-active);color:var(--sidebar-on)}
+.nav a[aria-current="page"]::before{content:"";position:absolute;inset-inline-start:-8px;top:9px;bottom:9px;width:3px;border-radius:3px;background:#36B5CC}
+.nav .count{margin-inline-start:auto;min-width:22px;height:20px;padding:0 6px;border-radius:999px;background:#36B5CC;color:#04182B;font-size:12px;font-weight:600;display:grid;place-items:center}
+.side hr{border:0;border-top:1px solid var(--sidebar-line);margin:8px 16px}
+.side .foot{margin-top:auto;padding:8px}
+.main{flex:1;min-width:0;display:flex;flex-direction:column}
+.top{height:56px;display:flex;align-items:center;gap:12px;padding:0 24px;border-bottom:1px solid var(--line);flex:none}
+.top h1{font-size:20px;font-weight:600;margin:0;white-space:nowrap}
+.search{flex:1;max-width:420px;margin-inline-start:auto;display:flex;align-items:center;gap:8px;height:40px;padding:0 12px;border:1px solid var(--line-strong);border-radius:var(--r-control);background:var(--bg);color:var(--subtle)}
+.search input{flex:1;border:0;background:transparent;font:inherit;color:var(--text);min-width:0}
+.search input:focus{outline:0}
+.search kbd{font:500 12px/1 var(--font);border:1px solid var(--line);border-radius:4px;padding:3px 5px;color:var(--subtle)}
+.need{display:flex;align-items:center;gap:8px;height:40px;padding:0 12px;border:1px solid var(--line-strong);border-radius:var(--r-control);background:var(--bg);font-weight:500}
+.need .dot{min-width:22px;height:20px;padding:0 6px;border-radius:999px;background:var(--danger);color:#fff;font-size:12px;font-weight:600;display:grid;place-items:center}
+.me{display:flex;align-items:center;gap:8px;height:40px;padding:0 8px;border:0;background:transparent;border-radius:var(--r-control)}
+.me:hover{background:var(--card)}
+.avatar{width:30px;height:30px;border-radius:50%;background:var(--primary-soft);color:var(--primary);display:grid;place-items:center;font-weight:600;font-size:13px}
+.banner{display:flex;align-items:center;gap:12px;padding:10px 24px;background:var(--danger-soft);color:var(--danger);border-bottom:1px solid var(--line);font-weight:500;flex:none}
+.banner span{flex:1;min-width:0}
+.view{display:none;flex:1;min-height:0;overflow:auto;padding:24px}
+.app[data-screen="today"] #view-today,.app[data-screen="orders"] #view-orders,.app[data-screen="kit"] #view-kit{display:block}
+.app[data-screen="chats"] #view-chats{display:grid}
+.wrap{max-width:1180px;margin:0 auto;display:flex;flex-direction:column;gap:16px}
+.bottom{display:none}
+
+/* ── العدّة ── */
+.btn{display:inline-flex;align-items:center;justify-content:center;gap:8px;height:40px;padding:0 16px;border-radius:var(--r-control);border:1px solid transparent;font-weight:600;white-space:nowrap;transition:background .15s var(--ease),border-color .15s var(--ease)}
+.btn.primary{background:var(--primary);color:var(--on-primary)}
+.btn.primary:hover{background:var(--primary-hover)}
+.btn.secondary{background:var(--bg);border-color:var(--line-strong);color:var(--text)}
+.btn.secondary:hover{background:var(--card)}
+.btn.ghost{background:transparent;color:var(--muted)}
+.btn.ghost:hover{background:var(--card);color:var(--text)}
+.btn.danger{background:var(--danger);color:#fff}
+.btn.sm{height:32px;padding:0 12px;font-size:13px}
+.btn.lg{height:48px;padding:0 20px;font-size:16px}
+.btn.icon{width:40px;padding:0}
+.chip{display:inline-flex;align-items:center;gap:6px;height:24px;padding:0 10px;border-radius:999px;font-size:12px;font-weight:500;white-space:nowrap;background:var(--surface);color:var(--muted)}
+.chip::before{content:"";width:6px;height:6px;border-radius:50%;background:currentColor}
+.chip.info{background:var(--primary-soft);color:var(--primary)}
+.chip.ok{background:var(--success-soft);color:var(--success)}
+.chip.warn{background:var(--warning-soft);color:var(--warning)}
+.chip.bad{background:var(--danger-soft);color:var(--danger)}
+.card{background:var(--card);border:1px solid var(--line);border-radius:var(--r-card);padding:20px}
+.card h2{font-size:16px;font-weight:600;margin:0}
+.head{display:flex;align-items:center;gap:12px;margin-bottom:12px}
+.head .sp{margin-inline-start:auto}
+.seg{display:inline-flex;padding:3px;border-radius:8px;background:var(--surface);gap:2px}
+.seg button{height:32px;padding:0 14px;border:0;border-radius:6px;background:transparent;color:var(--muted);font-weight:500}
+.seg button[aria-pressed="true"]{background:var(--bg);color:var(--text);box-shadow:var(--raised)}
+.tabs{display:flex;gap:4px;border-bottom:1px solid var(--line);overflow-x:auto}
+.tabs button{height:44px;padding:0 14px;border:0;background:transparent;color:var(--muted);font-weight:500;border-bottom:2px solid transparent;white-space:nowrap;display:flex;align-items:center;gap:8px}
+.tabs button[aria-selected="true"]{color:var(--primary);border-bottom-color:var(--primary)}
+.tabs .n{min-width:20px;height:18px;padding:0 5px;border-radius:999px;background:var(--surface);font-size:12px;display:grid;place-items:center}
+.tabs .n.hot{background:var(--danger-soft);color:var(--danger)}
+.muted{color:var(--muted)} .subtle{color:var(--subtle);font-size:13px}
+
+/* ── اليوم ── */
+.todo{display:flex;flex-direction:column}
+.todo .row{display:flex;align-items:center;gap:14px;padding:12px 0;border-top:1px solid var(--line)}
+.todo .row:first-child{border-top:0}
+.todo .bar{width:4px;align-self:stretch;border-radius:4px;background:var(--danger)}
+.todo .bar.mid{background:var(--warning)}
+.todo .t{flex:1;min-width:0}
+.todo .t b{display:block;font-weight:600}
+.kpis{display:grid;grid-template-columns:repeat(4,1fr);gap:16px}
+.kpi{background:var(--card);border:1px solid var(--line);border-radius:var(--r-card);padding:18px 20px}
+.kpi .l{display:flex;align-items:center;gap:6px;color:var(--muted);font-size:13px}
+.kpi .v{font-size:32px;font-weight:600;line-height:1.2;margin:6px 0 2px}
+.kpi .v small{font-size:14px;font-weight:500;color:var(--muted)}
+.up{color:var(--success);font-size:13px} .down{color:var(--danger);font-size:13px}
+.info-i{width:16px;height:16px;border-radius:50%;border:1px solid var(--line-strong);font-size:11px;display:inline-grid;place-items:center;color:var(--subtle);background:transparent;padding:0;line-height:1}
+.two{display:grid;grid-template-columns:1fr 1.4fr;gap:16px}
+.list .li{display:flex;align-items:center;gap:12px;padding:10px 0;border-top:1px solid var(--line)}
+.list .li:first-child{border-top:0}
+.list .li .t{flex:1;min-width:0}
+.timer{display:inline-flex;align-items:center;gap:6px;color:var(--warning);font-weight:600}
+
+/* ── المحادثات ── */
+#view-chats{grid-template-columns:320px minmax(0,1fr) 340px;gap:0;padding:0;overflow:hidden}
+.clist{border-inline-end:1px solid var(--line);display:flex;flex-direction:column;min-height:0}
+.clist .tools{padding:12px 12px 0;display:flex;flex-direction:column;gap:8px}
+.conv{display:flex;gap:10px;padding:12px;border-bottom:1px solid var(--line);border-inline-start:3px solid transparent;text-align:start;background:transparent;border-top:0;border-inline-end:0;width:100%}
+.conv[aria-current="true"]{background:var(--primary-soft);border-inline-start-color:var(--primary)}
+.conv .b{flex:1;min-width:0}
+.conv .n{display:flex;gap:8px;align-items:baseline}
+.conv .n b{font-weight:600;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.conv .n time{margin-inline-start:auto;font-size:12px;color:var(--subtle)}
+.conv p{margin:2px 0 6px;color:var(--muted);font-size:13px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.thread{display:flex;flex-direction:column;min-width:0;min-height:0}
+.thead{display:flex;align-items:center;gap:12px;padding:10px 16px;border-bottom:1px solid var(--line)}
+.thead .who{min-width:0;flex:1}
+.thead .who b{font-weight:600;display:block;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.thead .who .subtle{display:block;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.thead .seg{flex:none}
+.seg button{white-space:nowrap}
+.msgs{flex:1;overflow:auto;padding:16px;display:flex;flex-direction:column;gap:10px;background:var(--bg)}
+.m{max-width:72%;padding:9px 13px;border-radius:12px;border:1px solid var(--line);background:var(--card);align-self:flex-start;transition:box-shadow .2s var(--ease)}
+.m small{display:block;font-size:12px;color:var(--subtle);margin-top:2px}
+.m.ai{align-self:flex-end;background:var(--primary-soft);border-color:transparent}
+.m.ai .tag{font-size:12px;font-weight:600;color:var(--primary);display:block}
+.m.hl{box-shadow:0 0 0 3px var(--warning)}
+.comp{border-top:1px solid var(--line);padding:12px 16px;display:flex;flex-direction:column;gap:8px}
+.comp .line{display:flex;gap:8px;align-items:center}
+.comp input[type="text"]{flex:1;height:40px;border:1px solid var(--line-strong);border-radius:var(--r-control);padding:0 12px;font:inherit;background:var(--bg);color:var(--text);min-width:0}
+.comp label{display:flex;align-items:center;gap:6px;color:var(--muted);font-size:13px}
+.panel{border-inline-start:1px solid var(--line);overflow:auto;padding:16px;display:flex;flex-direction:column;gap:14px;background:var(--bg)}
+.ocard{border:1px solid var(--line);border-radius:var(--r-card);background:var(--card);overflow:hidden}
+.ocard .st{display:flex;align-items:center;gap:8px;padding:12px 14px;background:var(--warning-soft);color:var(--warning);font-weight:600}
+.ocard .st .sp{margin-inline-start:auto;font-weight:500;font-size:13px}
+.ocard .bd{padding:12px 14px;display:flex;flex-direction:column;gap:8px}
+.kv{display:grid;grid-template-columns:64px 1fr auto;gap:8px;align-items:baseline}
+.kv dt{color:var(--subtle);font-size:13px} .kv dd{margin:0;font-weight:500;min-width:0;overflow-wrap:anywhere}
+.ev{border:0;background:transparent;color:var(--primary);font-size:12px;padding:0;text-decoration:underline;text-underline-offset:3px}
+.item{display:flex;justify-content:space-between;gap:8px;font-weight:500}
+.tot{display:flex;justify-content:space-between;border-top:1px dashed var(--line-strong);padding-top:8px;font-weight:600}
+.ocard .ac{display:flex;gap:8px;padding:12px 14px;border-top:1px solid var(--line)}
+.ocard .ac .btn.primary{flex:1}
+details.box{border:1px solid var(--line);border-radius:var(--r-card);padding:10px 14px;background:var(--card)}
+details.box summary{font-weight:600;cursor:pointer}
+details.box ul{margin:8px 0 0;padding:0;list-style:none;display:flex;flex-direction:column;gap:6px;font-size:13px;color:var(--muted)}
+
+/* ── الطلبات ── */
+.tablewrap{overflow-x:auto;border:1px solid var(--line);border-radius:var(--r-card);background:var(--card)}
+table{border-collapse:collapse;width:100%;min-width:760px}
+th{font-size:12px;font-weight:500;color:var(--subtle);text-align:start;padding:10px 14px;background:var(--surface);white-space:nowrap}
+td{padding:12px 14px;border-top:1px solid var(--line);white-space:nowrap}
+tbody tr{cursor:pointer}
+tbody tr:hover{background:var(--surface)}
+.filters{display:flex;gap:8px;flex-wrap:wrap}
+.filters .search{margin:0;max-width:340px}
+.scrim{position:fixed;inset:0;background:rgb(5 15 31 / .45);display:none;z-index:5}
+.drawer{position:fixed;top:0;bottom:0;inset-inline-end:0;width:min(480px,100%);background:var(--bg);color:var(--text);box-shadow:var(--overlay);border-start-start-radius:var(--r-sheet);border-end-start-radius:var(--r-sheet);padding:20px;display:none;flex-direction:column;gap:14px;overflow:auto;z-index:6}
+.app.open .scrim{display:block} .app.open .drawer{display:flex}
+.oms{border:1px solid var(--line);border-radius:var(--r-card);padding:12px 14px;display:flex;flex-direction:column;gap:6px}
+
+/* ── صفحة العدّة ── */
+.rowx{display:flex;gap:10px;flex-wrap:wrap;align-items:center}
+.sw{display:flex;gap:8px;flex-wrap:wrap}
+.sw i{width:84px;height:54px;border-radius:8px;border:1px solid var(--line);display:flex;align-items:flex-end;padding:4px 6px;font:500 11px/1.2 var(--font);font-style:normal}
+.callout{border-radius:var(--r-card);padding:12px 14px;display:flex;flex-direction:column;gap:6px}
+.callout.risk{background:var(--danger-soft);color:var(--danger)}
+.callout.fix{background:var(--warning-soft);color:var(--warning)}
+.switch{position:relative;width:42px;height:24px;border-radius:999px;border:0;background:var(--line-strong);padding:0}
+.switch::after{content:"";position:absolute;top:3px;inset-inline-start:3px;width:18px;height:18px;border-radius:50%;background:#fff;transition:inset-inline-start .15s var(--ease)}
+.switch[aria-checked="true"]{background:var(--primary)}
+.switch[aria-checked="true"]::after{inset-inline-start:21px}
+.note{position:fixed;inset-inline-end:16px;bottom:16px;background:var(--sidebar);color:#E6F1F4;border-radius:999px;padding:6px 14px;font-size:12px;box-shadow:var(--overlay);z-index:4}
+
+@media (max-width:1180px){
+  /* عرض متوسط: القائمة تصير شريط أيقونات حتى تتنفّس المحادثة */
+  .side{width:64px}
+  .brand{justify-content:center;padding:16px 0 12px}
+  .brand > div:last-child{display:none}
+  .nav a{justify-content:center;padding:0;font-size:0;gap:0}
+  .nav .count{font-size:11px;position:absolute;top:3px;inset-inline-end:6px;min-width:18px;height:18px;padding:0 4px;margin:0}
+  .side hr{margin:8px 12px}
+  #view-chats{grid-template-columns:250px minmax(0,1fr) 290px}
+  .kpis{grid-template-columns:repeat(2,1fr)}
+}
+@media (max-width:860px){
+  .side{display:none}
+  .bottom{display:flex;border-top:1px solid var(--line);background:var(--bg);flex:none}
+  .bottom a{flex:1;display:flex;flex-direction:column;align-items:center;gap:2px;padding:8px 4px;color:var(--muted);text-decoration:none;font-size:12px}
+  .bottom a[aria-current="page"]{color:var(--primary);font-weight:600}
+  .top{padding:0 16px}.search{display:none}.need{margin-inline-start:auto}.me span{display:none}
+  .banner{padding:10px 16px}.view{padding:16px}
+  .two{grid-template-columns:1fr}
+  #view-chats{grid-template-columns:1fr;grid-template-rows:auto 1fr;overflow:auto;padding:0}
+  .clist{display:none}
+  .panel{order:-1;border:0;border-bottom:1px solid var(--line);padding:12px}
+  .panel .only-wide{display:none}
+  .thread{min-height:60vh}.m{max-width:88%}
+  .note{bottom:76px}
+}
+@media (prefers-reduced-motion:reduce){*{transition:none !important}}
+</style>
+</head>
+<body>
+<div class="app" id="app" data-mode="light" data-screen="today">
+
+  <aside class="side" aria-label="القائمة الرئيسية">
+    <div class="brand"><div class="logo">Z</div><div><b>Zaki response</b><small>متجر 1</small></div></div>
+    <nav class="nav">
+      <a href="#today" data-go="today"><svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M3 11l9-8 9 8v9a1 1 0 0 1-1 1h-5v-6h-6v6H4a1 1 0 0 1-1-1z"/></svg>اليوم</a>
+      <a href="#chats" data-go="chats"><svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21 12a8 8 0 0 1-11.5 7.2L4 21l1.6-4.8A8 8 0 1 1 21 12z"/></svg>المحادثات<span class="count num">3</span></a>
+      <a href="#orders" data-go="orders"><svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M6 7h12l1 13H5zM9 7a3 3 0 0 1 6 0"/></svg>الطلبات<span class="count num">1</span></a>
+      <a href="#kit" data-go="kit"><svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M4 9l1-5h14l1 5M4 9v11h16V9M4 9h16M9 20v-6h6v6"/></svg>المتجر</a>
+      <a href="#kit" data-go="kit"><svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 3l2.2 5.8L20 11l-5.8 2.2L12 19l-2.2-5.8L4 11l5.8-2.2z"/></svg>الوكيل الذكي</a>
+      <a href="#kit" data-go="kit"><svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M4 20V10M10 20V4M16 20v-8M22 20H2"/></svg>التقارير</a>
+    </nav>
+    <div class="foot">
+      <hr>
+      <nav class="nav"><a href="#kit" data-go="kit"><svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="3"/><path d="M19 12a7 7 0 0 0-.1-1.2l2-1.5-2-3.4-2.3.9a7 7 0 0 0-2-1.2L14 3h-4l-.5 2.6a7 7 0 0 0-2 1.2l-2.4-.9-2 3.4 2 1.5a7 7 0 0 0 0 2.4l-2 1.5 2 3.4 2.4-.9a7 7 0 0 0 2 1.2L10 21h4l.5-2.6a7 7 0 0 0 2-1.2l2.4.9 2-3.4-2-1.5c.07-.4.1-.8.1-1.2z"/></svg>الإعدادات</a></nav>
+    </div>
+  </aside>
+
+  <div class="main">
+    <header class="top">
+      <h1 id="title">اليوم</h1>
+      <label class="search" for="q"><svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="11" cy="11" r="7"/><path d="M20 20l-3.5-3.5"/></svg><input id="q" type="search" placeholder="ابحث: عميل، رقم هاتف، رقم طلب"><kbd>Ctrl K</kbd></label>
+      <button class="need" type="button" data-go="today"><svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M6 9a6 6 0 1 1 12 0c0 6 2 7 2 7H4s2-1 2-7M10 20a2 2 0 0 0 4 0"/></svg>يحتاجك<span class="dot num">4</span></button>
+      <button class="me" type="button" id="mode" title="بدّل بين الفاتح والداكن"><span class="avatar">أ</span><span>أحمد · <u>فاتح / داكن</u></span></button>
+    </header>
+
+    <div class="banner" role="status">
+      <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 3l10 18H2zM12 10v5M12 18v.5"/></svg>
+      <span>ربط الـ OMS متوقف منذ <span class="num">9:40</span> م. <span class="num">3</span> طلبات مثبّتة تنتظر الإرسال.</span>
+      <button class="btn sm danger" type="button">أصلح الربط</button>
+    </div>
+
+    <!-- ═════════ اليوم ═════════ -->
+    <main class="view" id="view-today">
+      <div class="wrap">
+        <div class="head"><span class="muted">الإثنين 16 تشرين الثاني</span>
+          <div class="seg sp" role="group" aria-label="الفترة"><button type="button" aria-pressed="true">اليوم</button><button type="button" aria-pressed="false">أمس</button><button type="button" aria-pressed="false">7 أيام</button><button type="button" aria-pressed="false">30 يوم</button></div>
+        </div>
+
+        <section class="card" aria-labelledby="h-need">
+          <div class="head"><h2 id="h-need">يحتاجك الآن</h2><span class="chip bad num">4</span></div>
+          <div class="todo">
+            <div class="row"><span class="bar"></span><div class="t"><b>طلب يحتاج مراجعة: رقمان مختلفان</b><span class="subtle">سارة الخطيب · ماء الكمأ × 2 · صفحة كهربا</span></div><button class="btn sm primary" type="button" data-open>راجع الطلب</button></div>
+            <div class="row"><span class="bar"></span><div class="t"><b>الوكيل وعد بطلب والبيانات ناقصة</b><span class="subtle">عميل بلا اسم · ناقص: العنوان · قبل <span class="num">6</span> دقائق</span></div><a class="btn sm secondary" href="#chats">افتح المحادثة</a></div>
+            <div class="row"><span class="bar mid"></span><div class="t"><b>طلب تعديل بعد التثبيت: تغيير العنوان</b><span class="subtle"><span class="num">#ORD-4141</span> · عند فريق التأكيد · قابل للتعديل</span></div><button class="btn sm secondary" type="button" data-open>راجع التعديل</button></div>
+            <div class="row"><span class="bar mid"></span><div class="t"><b>صفحة «Power Hub» بلا مجموعة منتجات</b><span class="subtle">الوكيل لا يعرف أي منتج لهذه الصفحة</span></div><a class="btn sm ghost" href="#kit">اختر مجموعة</a></div>
+          </div>
+        </section>
+
+        <div class="kpis">
+          <div class="kpi"><div class="l">محادثات جديدة <button class="info-i" type="button" title="عدد المحادثات التي فُتحت اليوم">i</button></div><div class="v num">38</div><span class="up">▲ <span class="num">6</span> عن أمس</span></div>
+          <div class="kpi"><div class="l">طلبات مثبّتة <button class="info-i" type="button" title="الطلبات التي ثُبّتت اليوم">i</button></div><div class="v num">11</div><span class="up">▲ <span class="num">3</span> عن أمس</span></div>
+          <div class="kpi"><div class="l">قيمة الطلبات <button class="info-i" type="button" title="مجموع الطلبات المثبّتة اليوم، لكل عملة لحالها">i</button></div><div class="v"><span class="num">220</span> <small>USD</small></div><span class="up">▲ <span class="num">40</span> عن أمس</span></div>
+          <div class="kpi"><div class="l">نسبة التحويل <button class="info-i" type="button" title="محادثات اليوم التي صار لها طلب مثبّت ÷ محادثات اليوم">i</button></div><div class="v num">29%</div><span class="down">▼ <span class="num">2</span> نقطة</span></div>
+        </div>
+
+        <div class="two">
+          <section class="card" aria-labelledby="h-set">
+            <div class="head"><h2 id="h-set">تتثبّت الآن</h2><span class="chip warn num">2</span></div>
+            <div class="list">
+              <div class="li"><div class="t"><b>أبو أحمد</b><div class="subtle">كريم حرير × 1 · <span class="num">20 USD</span></div></div><span class="timer"><svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="13" r="8"/><path d="M12 9v4l2.5 2M9 2h6"/></svg><span class="num" data-timer="492">08:12</span></span></div>
+              <div class="li"><div class="t"><b>ليلى حداد</b><div class="subtle">طاقية إنبات الشعر × 1 · <span class="num">50 USD</span></div></div><span class="timer"><svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="13" r="8"/><path d="M12 9v4l2.5 2M9 2h6"/></svg><span class="num" data-timer="160">02:40</span></span></div>
+            </div>
+          </section>
+          <section class="card" aria-labelledby="h-last">
+            <div class="head"><h2 id="h-last">آخر الطلبات</h2><a class="btn sm ghost sp" href="#orders">كل الطلبات</a></div>
+            <div class="list">
+              <div class="li"><span class="num muted">#ORD-4152</span><div class="t">نور العلي</div><span class="chip info">عند فريق التأكيد</span><span class="num">20 USD</span></div>
+              <div class="li"><span class="num muted">#ORD-4151</span><div class="t">خالد منصور</div><span class="chip ok">بالطريق</span><span class="num">45 USD</span></div>
+              <div class="li"><span class="num muted">#ORD-4149</span><div class="t">هبة يوسف</div><span class="chip ok">تم التسليم</span><span class="num">15 USD</span></div>
+              <div class="li"><span class="num muted">#ORD-4147</span><div class="t">عمر درويش</div><span class="chip">ملغي · العميل</span><span class="num">68 USD</span></div>
+            </div>
+          </section>
+        </div>
+      </div>
+    </main>
+
+    <!-- ═════════ المحادثات ═════════ -->
+    <main class="view" id="view-chats">
+      <div class="clist">
+        <div class="tools">
+          <label class="search" for="cq" style="max-width:none;margin:0"><svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="11" cy="11" r="7"/><path d="M20 20l-3.5-3.5"/></svg><input id="cq" type="search" placeholder="ابحث في المحادثات"></label>
+          <div class="tabs" role="tablist"><button type="button" role="tab" aria-selected="true">الكل</button><button type="button" role="tab" aria-selected="false">يحتاجك <span class="n hot num">2</span></button><button type="button" role="tab" aria-selected="false">جديدة</button></div>
+        </div>
+        <button class="conv" type="button" aria-current="true"><span class="avatar">أ</span><span class="b"><span class="n"><b>أبو أحمد</b><time class="num">10:26</time></span><p>تمام، سجّلت بياناتك ورح توصلك رسالة التثبيت</p><span class="chip warn">بانتظار التثبيت</span></span></button>
+        <button class="conv" type="button"><span class="avatar">س</span><span class="b"><span class="n"><b>سارة الخطيب</b><time class="num">10:19</time></span><p>هاد رقمي التاني إذا ما رديت</p><span class="chip bad">يحتاج مراجعة</span></span></button>
+        <button class="conv" type="button"><span class="avatar">؟</span><span class="b"><span class="n"><b>عميل</b><time class="num">10:11</time></span><p>وعليكم السلام، كيف فيني ساعدك؟</p><span class="chip">الوكيل يرد</span></span></button>
+        <button class="conv" type="button"><span class="avatar">ن</span><span class="b"><span class="n"><b>نور العلي</b><time class="num">09:48</time></span><p>تم تثبيت طلبك، رقم الطلب ORD-4152</p><span class="chip info">عند فريق التأكيد</span></span></button>
+      </div>
+
+      <section class="thread" aria-label="المحادثة">
+        <div class="thead">
+          <span class="avatar">أ</span>
+          <div class="who"><b>أبو أحمد</b><span class="subtle">ماسنجر · صفحة كهربا</span></div>
+          <div class="seg sp" role="group" aria-label="من يرد"><button type="button" aria-pressed="true">الوكيل يرد</button><button type="button" aria-pressed="false">أنا أرد</button></div>
+          <button class="btn ghost icon" type="button" aria-label="خيارات أخرى" title="أنهِ المحادثة · اقتراحات رد · حذف">⋯</button>
+        </div>
+        <div class="msgs" id="msgs">
+          <div class="m" id="m1">بدي اطلب كريم فارا<small class="num">10:21</small></div>
+          <div class="m ai" id="m2"><span class="tag">الوكيل</span>كريم فارا ما عندنا منه حاليًا. متوفر كريم حرير بـ 20 USD، بتحب أجهزلك عبوة؟<small class="num">10:21</small></div>
+          <div class="m" id="m3">اي بدي عبوة وحدة<small class="num">10:22</small></div>
+          <div class="m ai" id="m4"><span class="tag">الوكيل</span>تمام، عبوة كريم حرير وحدة بـ 20 USD. بعتلي عنوانك ورقم موبايلك للتوصيل.<small class="num">10:23</small></div>
+          <div class="m" id="m5">العنوان حلب، الفرقان، جانب الجامع<small class="num">10:24</small></div>
+          <div class="m" id="m6">ورقمي 0991 234 567<small class="num">10:24</small></div>
+          <div class="m ai" id="m7"><span class="tag">الوكيل</span>وصلني: كريم حرير × 1، الإجمالي 20 USD، التوصيل إلى حلب. أثبّت الطلب؟<small class="num">10:24</small></div>
+          <div class="m" id="m8">اي<small class="num">10:25</small></div>
+          <div class="m ai" id="m9"><span class="tag">الوكيل</span>تمام، سجّلت بياناتك ورح توصلك رسالة التثبيت برقم الطلب خلال دقائق.<small class="num">10:26</small></div>
+        </div>
+        <div class="comp">
+          <div class="line"><button class="btn secondary icon" type="button" aria-label="أرفق ملف">＋</button><input id="reply" type="text" placeholder="اكتب ردّك" aria-label="الرد"><button class="btn primary" type="button">إرسال</button></div>
+          <label for="note"><input id="note" type="checkbox"> ملاحظة داخلية (لا تُرسل للعميل)</label>
+        </div>
+      </section>
+
+      <aside class="panel" aria-label="بطاقة الطلب">
+        <div class="ocard">
+          <div class="st"><svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="13" r="8"/><path d="M12 9v4l2.5 2M9 2h6"/></svg>يتثبّت خلال <span class="num" data-timer="492">08:12</span><span class="sp">ثم يُرسل للـ OMS</span></div>
+          <div class="bd">
+            <div class="item"><span>كريم حرير × <span class="num">1</span></span><span class="num">20 USD</span></div>
+            <div class="tot"><span>الإجمالي</span><span class="num">20 USD</span></div>
+            <dl class="kv"><dt>الاسم</dt><dd>أبو أحمد</dd><span class="subtle">من الملف</span></dl>
+            <dl class="kv"><dt>الهاتف</dt><dd class="num">0991 234 567</dd><button class="ev" type="button" data-ev="m6">من الرسالة</button></dl>
+            <dl class="kv"><dt>العنوان</dt><dd>حلب · الفرقان، جانب الجامع</dd><button class="ev" type="button" data-ev="m5">من الرسالة</button></dl>
+            <dl class="kv"><dt>الموافقة</dt><dd>صريحة</dd><button class="ev" type="button" data-ev="m8">من الرسالة</button></dl>
+          </div>
+          <div class="ac"><button class="btn primary" type="button">ثبّت الآن</button><button class="btn secondary" type="button">أوقف</button><button class="btn ghost icon" type="button" aria-label="عدّل أو ألغِ">⋯</button></div>
+        </div>
+        <details class="box only-wide" open><summary>العميل</summary><ul><li>عميل جديد · أول طلب</li><li>ماسنجر · صفحة كهربا</li><li><a href="#chats" style="color:var(--primary)">ملف العميل</a></li></ul></details>
+        <details class="box only-wide"><summary>السجل</summary><ul><li><span class="num">10:26</span> · قراءة: الطلب مكتمل، بدأ عدّ التثبيت</li><li><span class="num">10:25</span> · العميل وافق</li><li><span class="num">10:24</span> · أُضيف الهاتف والعنوان</li></ul></details>
+      </aside>
+    </main>
+
+    <!-- ═════════ الطلبات ═════════ -->
+    <main class="view" id="view-orders">
+      <div class="wrap">
+        <div class="tabs" role="tablist"><button type="button" role="tab" aria-selected="true">قيد التثبيت <span class="n num">2</span></button><button type="button" role="tab" aria-selected="false">تحتاج مراجعة <span class="n hot num">1</span></button><button type="button" role="tab" aria-selected="false">عند فريق التأكيد <span class="n num">6</span></button><button type="button" role="tab" aria-selected="false">بالطريق <span class="n num">4</span></button><button type="button" role="tab" aria-selected="false">مسلّمة</button><button type="button" role="tab" aria-selected="false">ملغاة ومرتجعة</button><button type="button" role="tab" aria-selected="false">الكل</button></div>
+        <div class="filters">
+          <label class="search" for="oq"><svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="11" cy="11" r="7"/><path d="M20 20l-3.5-3.5"/></svg><input id="oq" type="search" placeholder="رقم الطلب، العميل، الهاتف"></label>
+          <button class="btn secondary" type="button">الصفحة: الكل</button><button class="btn secondary" type="button">آخر 7 أيام</button>
+          <button class="btn primary" type="button" style="margin-inline-start:auto">طلب يدوي</button>
+        </div>
+        <div class="tablewrap">
+          <table>
+            <thead><tr><th>الطلب</th><th>العميل</th><th>المنتجات</th><th>الإجمالي</th><th>الصفحة</th><th>الحالة</th><th>آخر تحديث</th></tr></thead>
+            <tbody>
+              <tr data-open><td class="num">#ORD-4153</td><td>أبو أحمد</td><td>كريم حرير × 1</td><td class="num">20 USD</td><td>كهربا</td><td><span class="chip warn">بانتظار التثبيت · <span class="num" data-timer="492">08:12</span></span></td><td class="subtle">قبل دقيقتين</td></tr>
+              <tr data-open><td class="num">#ORD-4154</td><td>ليلى حداد</td><td>طاقية إنبات الشعر × 1</td><td class="num">50 USD</td><td>كهربا</td><td><span class="chip warn">بانتظار التثبيت · <span class="num" data-timer="160">02:40</span></span></td><td class="subtle">قبل 7 دقائق</td></tr>
+              <tr data-open><td class="num">#ORD-4150</td><td>سارة الخطيب</td><td>ماء الكمأ × 2</td><td class="num">30 USD</td><td>كهربا</td><td><span class="chip bad">يحتاج مراجعة: رقمان</span></td><td class="subtle">قبل 9 دقائق</td></tr>
+              <tr data-open><td class="num">#ORD-4152</td><td>نور العلي</td><td>كريم حرير × 1</td><td class="num">20 USD</td><td>كهربا</td><td><span class="chip info">عند فريق التأكيد</span></td><td class="subtle">قبل 40 دقيقة</td></tr>
+              <tr data-open><td class="num">#ORD-4151</td><td>خالد منصور</td><td>صوبة القدس × 1</td><td class="num">68 USD</td><td>Power Hub</td><td><span class="chip ok">بالطريق</span></td><td class="subtle">اليوم 08:15</td></tr>
+              <tr data-open><td class="num">#ORD-4149</td><td>هبة يوسف</td><td>ماء الكمأ × 1</td><td class="num">15 USD</td><td>كهربا</td><td><span class="chip ok">تم التسليم</span></td><td class="subtle">أمس</td></tr>
+            </tbody>
+          </table>
+        </div>
+        <span class="subtle">عرض <span class="num">6</span> من <span class="num">143</span> · <a href="#orders" style="color:var(--primary)">تحميل المزيد</a></span>
+      </div>
+    </main>
+
+    <!-- ═════════ العدّة ═════════ -->
+    <main class="view" id="view-kit">
+      <div class="wrap">
+        <p class="muted" style="margin:0;max-width:65ch">هذه الصفحة تعرض قطع الواجهة: أربعة أنواع أزرار فقط، حالة واحدة لكل وضع، ومفتاح واحد للتشغيل والإيقاف. باقي الأقسام (المتجر، الوكيل الذكي، التقارير، الإعدادات) تُبنى من نفس القطع.</p>
+        <section class="card"><div class="head"><h2>الأزرار</h2><span class="subtle">زر أساسي واحد في كل شاشة</span></div>
+          <div class="rowx"><button class="btn primary" type="button">ثبّت الطلب</button><button class="btn secondary" type="button">أوقف التثبيت</button><button class="btn ghost" type="button">عدّل</button><button class="btn danger" type="button">ألغِ الطلب</button><button class="btn primary sm" type="button">صغير 32</button><button class="btn primary lg" type="button">كبير 48</button></div>
+        </section>
+        <section class="card"><div class="head"><h2>حالة الطلب</h2><span class="subtle">اسم واحد في كل الموقع</span></div>
+          <div class="rowx"><span class="chip">قيد التجميع</span><span class="chip warn">بانتظار التثبيت</span><span class="chip bad">يحتاج مراجعة</span><span class="chip info">مثبّت · بانتظار الإرسال</span><span class="chip info">عند فريق التأكيد</span><span class="chip ok">مؤكد · قيد التجهيز</span><span class="chip ok">بالطريق</span><span class="chip ok">تم التسليم</span><span class="chip bad">مرتجع</span><span class="chip">ملغي</span></div>
+        </section>
+        <section class="card"><div class="head"><h2>التشغيل والتنبيه</h2></div>
+          <div class="rowx" style="margin-bottom:14px"><button class="switch" type="button" role="switch" aria-checked="true" aria-label="التثبيت التلقائي"></button><span>التثبيت التلقائي للطلب النظيف</span></div>
+          <div class="callout risk"><b>تنبيه: مؤتمت</b><span>الطلب المكتمل يُثبَّت ويُرسل للـ OMS بعد 10 دقائق دون مراجعة.</span></div>
+          <div class="callout fix" style="margin-top:8px"><b>الحل</b><span>أوقف المفتاح أعلاه ليبقى كل طلب بانتظار زر «ثبّت الطلب»، أو زِد مهلة التثبيت.</span></div>
+        </section>
+        <section class="card"><div class="head"><h2>الألوان والخط</h2></div>
+          <div class="sw"><i style="background:var(--primary);color:var(--on-primary)">الأساسي</i><i style="background:var(--primary-soft)">المختار</i><i style="background:var(--card)">البطاقة</i><i style="background:var(--surface)">السطح</i><i style="background:var(--success-soft);color:var(--success)">نجاح</i><i style="background:var(--warning-soft);color:var(--warning)">انتظار</i><i style="background:var(--danger-soft);color:var(--danger)">خطر</i><i style="background:var(--sidebar);color:#E6F1F4">القائمة</i></div>
+          <div style="display:flex;flex-direction:column;gap:2px;margin-top:14px"><span style="font-size:32px;font-weight:600;line-height:1.2" class="num">32 الرقم الكبير</span><span style="font-size:20px;font-weight:600">20 عنوان الصفحة</span><span style="font-size:16px;font-weight:600">16 عنوان القسم</span><span>14 النص العادي والرسائل والجداول</span><span class="subtle">13 النص الثانوي</span><span style="font-size:12px;font-weight:500">12 الشارات وعناوين الأعمدة، ولا شيء أصغر</span></div>
+        </section>
+      </div>
+    </main>
+
+    <nav class="bottom" aria-label="التنقل">
+      <a href="#today" data-go="today">اليوم</a><a href="#chats" data-go="chats">المحادثات</a><a href="#orders" data-go="orders">الطلبات</a><a href="#kit" data-go="kit">المزيد</a>
+    </nav>
+  </div>
+
+  <div class="scrim" data-close></div>
+  <aside class="drawer" aria-label="تفاصيل الطلب">
+    <div class="head" style="margin:0"><h2 style="font-size:20px;margin:0"><span class="num">#ORD-4150</span></h2><span class="chip bad">يحتاج مراجعة</span><button class="btn ghost icon sp" type="button" data-close aria-label="إغلاق">✕</button></div>
+    <div class="callout risk"><b>رقمان مختلفان في المحادثة</b><span>العميلة كتبت رقمين دون توضيح أيهما للتوصيل. اختر الرقم ثم ثبّت.</span></div>
+    <div class="ocard"><div class="bd">
+      <div class="item"><span>ماء الكمأ × <span class="num">2</span></span><span class="num">30 USD</span></div>
+      <div class="tot"><span>الإجمالي</span><span class="num">30 USD</span></div>
+      <dl class="kv"><dt>الاسم</dt><dd>سارة الخطيب</dd><span></span></dl>
+      <dl class="kv"><dt>الهاتف</dt><dd class="num">0992 345 678</dd><button class="ev" type="button">من الرسالة</button></dl>
+      <dl class="kv"><dt>رقم آخر</dt><dd class="num">0993 456 789</dd><button class="ev" type="button">من الرسالة</button></dl>
+      <dl class="kv"><dt>العنوان</dt><dd>دمشق · المزة، بناء 12</dd><button class="ev" type="button">من الرسالة</button></dl>
+    </div><div class="ac"><button class="btn primary" type="button">ثبّت الطلب</button><button class="btn secondary" type="button">عدّل</button><button class="btn ghost icon" type="button" aria-label="ألغِ الطلب">⋯</button></div></div>
+    <div class="oms"><b>الـ OMS</b><span class="muted">لم يُرسل بعد. يُرسل تلقائيًا بعد التثبيت.</span></div>
+    <details class="box" open><summary>السجل</summary><ul><li><span class="num">10:19</span> · قراءة: رقم ثانٍ ظهر، أُوقف التثبيت</li><li><span class="num">10:12</span> · قراءة: الطلب مكتمل</li></ul></details>
+    <a class="btn secondary" href="#chats" data-close>افتح المحادثة</a>
+  </aside>
+
+  <div class="note">مرجع بصري · بيانات وهمية</div>
+</div>
+
+<script>
+(function(){
+  var app=document.getElementById("app"),title=document.getElementById("title");
+  var names={today:"اليوم",chats:"المحادثات",orders:"الطلبات",kit:"قطع الواجهة"};
+  function show(){
+    var s=(location.hash||"#today").slice(1); if(!names[s]) s="today";
+    app.setAttribute("data-screen",s); title.textContent=names[s]; app.classList.remove("open");
+    document.querySelectorAll("[data-go]").forEach(function(a){
+      if(a.tagName==="A"){ if(a.getAttribute("href")==="#"+s && a.textContent.indexOf(names[s])>-1 || (s==="kit"&&a.textContent.trim()==="المزيد")) a.setAttribute("aria-current","page"); else a.removeAttribute("aria-current"); }
+    });
+  }
+  window.addEventListener("hashchange",show); show();
+  document.querySelectorAll("button[data-go]").forEach(function(b){b.addEventListener("click",function(){location.hash=b.getAttribute("data-go");});});
+  document.getElementById("mode").addEventListener("click",function(){app.setAttribute("data-mode",app.getAttribute("data-mode")==="dark"?"light":"dark");});
+  document.querySelectorAll(".seg").forEach(function(g){g.addEventListener("click",function(e){var b=e.target.closest("button"); if(!b) return; g.querySelectorAll("button").forEach(function(x){x.setAttribute("aria-pressed",x===b?"true":"false");});});});
+  document.querySelectorAll(".tabs").forEach(function(g){g.addEventListener("click",function(e){var b=e.target.closest("button"); if(!b) return; g.querySelectorAll("button").forEach(function(x){x.setAttribute("aria-selected",x===b?"true":"false");});});});
+  document.querySelectorAll(".switch").forEach(function(s){s.addEventListener("click",function(){s.setAttribute("aria-checked",s.getAttribute("aria-checked")==="true"?"false":"true");});});
+  document.querySelectorAll("[data-open]").forEach(function(el){el.addEventListener("click",function(){app.classList.add("open");});});
+  document.querySelectorAll("[data-close]").forEach(function(el){el.addEventListener("click",function(){app.classList.remove("open");});});
+  document.addEventListener("keydown",function(e){if(e.key==="Escape") app.classList.remove("open");});
+  document.querySelectorAll("[data-ev]").forEach(function(b){b.addEventListener("click",function(){
+    var m=document.getElementById(b.getAttribute("data-ev")); if(!m) return;
+    document.querySelectorAll(".m.hl").forEach(function(x){x.classList.remove("hl");});
+    m.classList.add("hl"); m.scrollIntoView({block:"center"});
+  });});
+  var timers=[].slice.call(document.querySelectorAll("[data-timer]"));
+  function fmt(n){var m=Math.floor(n/60),s=n%60;return (m<10?"0":"")+m+":"+(s<10?"0":"")+s;}
+  setInterval(function(){timers.forEach(function(t){var n=Math.max(0,parseInt(t.getAttribute("data-timer"),10)-1);t.setAttribute("data-timer",n);t.textContent=fmt(n);});},1000);
+})();
+</script>
+</body>
+</html>
